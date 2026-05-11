@@ -15,11 +15,11 @@
   "files": ["dist", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/allstak-io/allstak-nestjs.git"
+    "url": "git+https://github.com/AllStak/allstak-nestjs.git"
   },
   "homepage": "https://allstak.sa",
   "bugs": {
-    "url": "https://github.com/allstak-io/allstak-nestjs/issues"
+    "url": "https://github.com/AllStak/allstak-nestjs/issues"
   },
   "publishConfig": {
     "access": "public"
