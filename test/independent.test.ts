@@ -34,7 +34,7 @@ describe('@allstak/nestjs — interceptor', () => {
 
     const interceptor = createAllStakNestInterceptor({
       apiKey: 'ask_dev_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
       environment: 'development',
       release: 'tier1-test',
       serviceName: 'nestjs-test',
@@ -61,16 +61,33 @@ describe('@allstak/nestjs — interceptor', () => {
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
     expect(captured.setHeader['x-allstak-trace-id']).toBe('a'.repeat(32));
     expect(captured.setHeader['x-allstak-request-id']).toBe('req-nest-test');
+    expect(captured.setHeader.baggage).toContain(`allstak-trace_id=${'a'.repeat(32)}`);
+    expect(captured.setHeader['allstak-baggage']).toContain('allstak-request_id=req-nest-test');
     const init = fetchSpy.mock.calls[0][1];
     expect(init.headers['User-Agent']).toBe(`${SDK_NAME}/${SDK_VERSION}`);
     const row = JSON.parse(init.body).requests[0];
     expect(row.path).toBe('/orders');
     expect(row.traceId).toBe('a'.repeat(32));
+    expect(row.requestId).toBe('req-nest-test');
+    expect(row.spanId).toMatch(/^[0-9a-f]{16}$/);
     expect(row.parentSpanId).toBe('b'.repeat(16));
-    expect(row.metadata.requestId).toBe('req-nest-test');
+    expect(row.metadata.requestId).toBeUndefined();
     expect(row.metadata['sdk.name']).toBe(SDK_NAME);
     expect(row.metadata['sdk.version']).toBe(SDK_VERSION);
     expect(row.requestHeaders).toBe('');
+    await vi.waitFor(() => expect(fetchSpy.mock.calls.some(([url]) => String(url).endsWith('/ingest/v1/spans'))).toBe(true));
+    const spanCall = fetchSpy.mock.calls.find(([url]) => String(url).endsWith('/ingest/v1/spans'))!;
+    const span = JSON.parse(spanCall[1].body).spans[0];
+    expect(span).toMatchObject({
+      traceId: 'a'.repeat(32),
+      spanId: expect.stringMatching(/^[0-9a-f]{16}$/),
+      parentSpanId: 'b'.repeat(16),
+      operation: 'nestjs.request',
+      description: 'POST /orders',
+      status: 'ok',
+      environment: 'development',
+      release: 'tier1-test',
+    });
   });
 
   it('captures redacted inbound headers when captureRequestHeaders=true', async () => {
@@ -82,7 +99,7 @@ describe('@allstak/nestjs — interceptor', () => {
 
     const interceptor = createAllStakNestInterceptor({
       apiKey: 'ask_dev_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
       captureRequestHeaders: true,
     });
     interceptor.intercept(
@@ -162,7 +179,7 @@ describe('@allstak/nestjs — beforeSend hook + redaction', () => {
     vi.stubGlobal('fetch', fetchSpy);
     const filter = createAllStakNestExceptionFilter({
       apiKey: 'ask_dev_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
       beforeSend: (event) => {
         // The metadata reaching here should already be redacted.
         const meta = (event.payload as any).metadata;
@@ -198,7 +215,7 @@ describe('@allstak/nestjs — beforeSend hook + redaction', () => {
     vi.stubGlobal('fetch', fetchSpy);
     const filter = createAllStakNestExceptionFilter({
       apiKey: 'ask_dev_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
       serviceName: 'nest-redact',
     });
     expect(() =>

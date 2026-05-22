@@ -46,7 +46,7 @@ export interface AllStakNestConfig {
 }
 
 export interface AllStakOutboundEvent {
-  path: '/ingest/v1/http-requests' | '/ingest/v1/errors';
+  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans';
   payload: Record<string, unknown>;
 }
 
@@ -129,6 +129,22 @@ function traceparent(traceId: string, spanId: string): string {
   return `00-${t}-${s}-01`;
 }
 
+function allstakBaggage(traceId: string, requestId: string, spanId: string): string {
+  return [
+    `allstak-trace_id=${traceId}`,
+    `allstak-request_id=${requestId}`,
+    `allstak-span_id=${spanId}`,
+  ].join(',');
+}
+
+function mergeBaggage(existing: string, traceId: string, requestId: string, spanId: string): string {
+  const preserved = existing
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part && !part.toLowerCase().startsWith('allstak-'));
+  return [...preserved, ...allstakBaggage(traceId, requestId, spanId).split(',')].join(',');
+}
+
 function setHeader(response: ResponseLike, name: string, value: string): void {
   response.setHeader?.(name, value);
   response.header?.(name, value);
@@ -200,6 +216,8 @@ export class AllStakNestInterceptor {
     request.allstakSpanId = spanId;
     request.allstakParentSpanId = headerValue(request.headers, 'x-allstak-parent-span-id') || parsed.parentSpanId;
     setHeader(response, 'traceparent', traceparent(traceId, spanId));
+    setHeader(response, 'baggage', mergeBaggage(headerValue(request.headers, 'baggage'), traceId, requestId, spanId));
+    setHeader(response, 'allstak-baggage', allstakBaggage(traceId, requestId, spanId));
     setHeader(response, 'x-allstak-trace-id', traceId);
     setHeader(response, 'x-allstak-request-id', requestId);
 
@@ -207,21 +225,26 @@ export class AllStakNestInterceptor {
     const finalize = (): void => {
       if (finalized) return;
       finalized = true;
+      const durationMs = Math.max(0, Date.now() - startedAt);
+      const path = pathOf(request);
+      const method = request.method.toUpperCase();
+      const statusCode = response.statusCode;
       const headerHost = request.headers.host;
       const userId = request.user?.id == null ? undefined : String(request.user.id);
       const payload: Record<string, unknown> = {
         requests: [
           {
             direction: 'inbound',
-            method: request.method.toUpperCase(),
+            method,
             host: typeof headerHost === 'string' ? headerHost : request.hostname || 'unknown',
-            path: pathOf(request),
-            statusCode: response.statusCode,
-            durationMs: Math.max(0, Date.now() - startedAt),
+            path,
+            statusCode,
+            durationMs,
             timestamp: new Date(startedAt).toISOString(),
             traceId,
             spanId,
             parentSpanId: request.allstakParentSpanId || '',
+            requestId,
             environment: this.config.environment || '',
             release: this.config.release || '',
             service: this.config.serviceName || '',
@@ -231,7 +254,6 @@ export class AllStakNestInterceptor {
               : '',
             metadata: redactMap(
               {
-                requestId,
                 'sdk.name': SDK_NAME,
                 'sdk.version': SDK_VERSION,
               },
@@ -241,6 +263,36 @@ export class AllStakNestInterceptor {
         ],
       };
       void dispatch(this.transport!, this.config, { path: '/ingest/v1/http-requests', payload });
+      void dispatch(this.transport!, this.config, {
+        path: '/ingest/v1/spans',
+        payload: {
+          spans: [
+            {
+              traceId,
+              spanId,
+              parentSpanId: request.allstakParentSpanId || '',
+              operation: 'nestjs.request',
+              description: `${method} ${path}`,
+              status: statusCode >= 500 ? 'error' : 'ok',
+              durationMs,
+              startTimeMillis: startedAt,
+              endTimeMillis: startedAt + durationMs,
+              service: this.config.serviceName || '',
+              environment: this.config.environment || '',
+              release: this.config.release || '',
+              tags: {
+                component: 'nestjs',
+                method,
+                statusCode: String(statusCode),
+              },
+              data: JSON.stringify({
+                host: typeof headerHost === 'string' ? headerHost : request.hostname || 'unknown',
+                path,
+              }),
+            },
+          ],
+        },
+      });
     };
     response.on?.('finish', finalize);
     response.on?.('close', finalize);
@@ -279,6 +331,9 @@ export class AllStakNestExceptionFilter {
       environment: this.config.environment || '',
       release: this.config.release || '',
       traceId: request.allstakTraceId || '',
+      spanId: request.allstakSpanId || '',
+      parentSpanId: request.allstakParentSpanId || '',
+      requestId: request.allstakRequestId || '',
       metadata: redactMap(
         {
           'sdk.name': SDK_NAME,
@@ -286,8 +341,6 @@ export class AllStakNestExceptionFilter {
           service: this.config.serviceName || '',
           httpMethod: request.method,
           httpPath: pathOf(request),
-          requestId: request.allstakRequestId || '',
-          spanId: request.allstakSpanId || '',
         },
         this.extraRedact,
       ),

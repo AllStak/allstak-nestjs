@@ -59,7 +59,7 @@ function captureFetch(): IngestCall[] {
 
 const cfg = {
   apiKey: 'ask_dev_test',
-  host: 'https://api.dev.allstak.sa',
+  host: 'https://api.allstak.sa',
   environment: 'test',
   release: 'nest-validation@1.0.0',
   serviceName: 'nest-validation',
@@ -112,6 +112,8 @@ describe('@allstak/nestjs against real NestJS 11', () => {
       expect(res.headers.get('x-allstak-trace-id')).toMatch(/^[0-9a-f]{32}$/);
       expect(res.headers.get('x-allstak-request-id')).toBeTruthy();
       expect(res.headers.get('traceparent')).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      expect(res.headers.get('allstak-baggage')).toContain(`allstak-trace_id=${res.headers.get('x-allstak-trace-id')}`);
+      expect(res.headers.get('baggage')).toContain(`allstak-request_id=${res.headers.get('x-allstak-request-id')}`);
 
       await vi.waitFor(() => expect(calls.length).toBeGreaterThan(0), { timeout: 1000 });
       const httpReq = calls.find((c) => c.url.endsWith('/ingest/v1/http-requests'));
@@ -121,6 +123,9 @@ describe('@allstak/nestjs against real NestJS 11', () => {
       expect(row.path).toBe('/health');
       expect(row.statusCode).toBe(200);
       expect(row.traceId).toBe(res.headers.get('x-allstak-trace-id'));
+      expect(row.requestId).toBe(res.headers.get('x-allstak-request-id'));
+      expect(row.spanId).toMatch(/^[0-9a-f]{16}$/);
+      expect(row.metadata.requestId).toBeUndefined();
     } finally { await app.close(); }
   });
 
@@ -154,6 +159,8 @@ describe('@allstak/nestjs against real NestJS 11', () => {
       expect(errCall.body.message).toBe('intentional boom');
       expect(errCall.body.metadata.httpPath).toBe('/boom');
       expect(errCall.body.traceId).toMatch(/^[0-9a-f]{32}$/);
+      expect(errCall.body.requestId).toMatch(/^[0-9a-f]{32}$|^req-/);
+      expect(errCall.body.spanId).toMatch(/^[0-9a-f]{16}$/);
     } finally { await app.close(); }
   });
 
