@@ -62,7 +62,7 @@ jobs:
           node -e "const sdk=require('@allstak/nestjs'); if (!sdk.AllStakNestInterceptor) throw new Error('missing CJS export')"
           node --input-type=module -e "const sdk=await import('@allstak/nestjs'); if (!sdk.AllStakNestInterceptor) throw new Error('missing ESM export')"
           printf "import { AllStakNestInterceptor } from '@allstak/nestjs';\\nvoid AllStakNestInterceptor;\\n" > smoke.ts
-          npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 smoke.ts
+          npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --types node smoke.ts
 
       - uses: actions/upload-artifact@v4
         with:
