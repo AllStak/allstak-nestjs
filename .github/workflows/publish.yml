@@ -58,7 +58,7 @@ jobs:
           cp "$TARBALL" "$TMP/package.tgz"
           cd "$TMP"
           npm init -y >/dev/null
-          npm install --ignore-scripts ./package.tgz typescript >/dev/null
+          npm install --ignore-scripts ./package.tgz typescript @types/node >/dev/null
           node -e "const sdk=require('@allstak/nestjs'); if (!sdk.AllStakNestInterceptor) throw new Error('missing CJS export')"
           node --input-type=module -e "const sdk=await import('@allstak/nestjs'); if (!sdk.AllStakNestInterceptor) throw new Error('missing ESM export')"
           printf "import { AllStakNestInterceptor } from '@allstak/nestjs';\\nvoid AllStakNestInterceptor;\\n" > smoke.ts
