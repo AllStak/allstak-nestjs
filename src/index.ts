@@ -41,6 +41,23 @@ export interface AllStakNestConfig {
    * sensitive values.
    */
   beforeSend?: (event: AllStakOutboundEvent) => AllStakOutboundEvent | null | Promise<AllStakOutboundEvent | null>;
+  /**
+   * Fraction 0..1 of error events captured. Default 1 (keep all). Applied at
+   * capture time, BEFORE beforeSend: dropped errors never reach beforeSend.
+   * Out-of-range or non-finite values clamp to [0, 1].
+   */
+  sampleRate?: number;
+  /**
+   * Fraction 0..1 of traces captured when this service is the trace origin
+   * (no inbound sampled flag). Default 1. Drives the propagated W3C
+   * `traceparent` sampled flag (`-01` kept / `-00` dropped) and gates whether
+   * the request/span events are emitted for that trace. When an inbound
+   * `traceparent` carries a sampled flag, the child inherits it and
+   * `tracesSampleRate` is not consulted.
+   */
+  tracesSampleRate?: number;
+  /** RNG seam for deterministic tests. Defaults to Math.random. Returns [0,1). */
+  random?: () => number;
   /** Override fetch (test injection). */
   fetch?: typeof fetch;
 }
@@ -68,6 +85,7 @@ interface RequestLike {
   allstakRequestId?: string;
   allstakSpanId?: string;
   allstakParentSpanId?: string;
+  allstakSampled?: boolean;
 }
 
 interface ResponseLike {
@@ -114,19 +132,36 @@ function randomHex(bytes: number): string {
   return Array.from({ length: bytes }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('');
 }
 
-function parseTraceparent(value: string): { traceId?: string; parentSpanId?: string } {
+function parseTraceparent(value: string): {
+  traceId?: string;
+  parentSpanId?: string;
+  sampled?: boolean;
+} {
   const parts = value.split('-');
   if (parts.length < 4) return {};
+  const flags = parts[3];
+  // trace-flags is a 2-hex-digit field; bit 0 is the "sampled" flag.
+  const sampled = /^[0-9a-fA-F]{2}$/.test(flags ?? '')
+    ? (parseInt(flags, 16) & 0x01) === 0x01
+    : undefined;
   return {
     traceId: parts[1]?.length === 32 ? parts[1] : undefined,
     parentSpanId: parts[2]?.length === 16 ? parts[2] : undefined,
+    sampled,
   };
 }
 
-function traceparent(traceId: string, spanId: string): string {
+function traceparent(traceId: string, spanId: string, sampled: boolean): string {
   const t = traceId.length === 32 ? traceId : randomHex(16);
   const s = spanId.length === 16 ? spanId : randomHex(8);
-  return `00-${t}-${s}-01`;
+  return `00-${t}-${s}-${sampled ? '01' : '00'}`;
+}
+
+function clamp01(n: number | undefined): number {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return 1;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
 }
 
 function allstakBaggage(traceId: string, requestId: string, spanId: string): string {
@@ -211,11 +246,18 @@ export class AllStakNestInterceptor {
     const traceId = headerValue(request.headers, 'x-allstak-trace-id') || parsed.traceId || randomHex(16);
     const requestId = headerValue(request.headers, 'x-allstak-request-id') || headerValue(request.headers, 'x-request-id') || traceId;
     const spanId = randomHex(8);
+    // Trace sampling: inherit an inbound sampled flag (child follows root);
+    // otherwise this service is the trace origin, so decide via tracesSampleRate
+    // and drive the propagated traceparent flag accordingly.
+    const tracesSampleRate = clamp01(this.config.tracesSampleRate);
+    const random = this.config.random || Math.random;
+    const sampled = parsed.sampled ?? (tracesSampleRate >= 1 ? true : random() < tracesSampleRate);
     request.allstakTraceId = traceId;
     request.allstakRequestId = requestId;
     request.allstakSpanId = spanId;
+    request.allstakSampled = sampled;
     request.allstakParentSpanId = headerValue(request.headers, 'x-allstak-parent-span-id') || parsed.parentSpanId;
-    setHeader(response, 'traceparent', traceparent(traceId, spanId));
+    setHeader(response, 'traceparent', traceparent(traceId, spanId, sampled));
     setHeader(response, 'baggage', mergeBaggage(headerValue(request.headers, 'baggage'), traceId, requestId, spanId));
     setHeader(response, 'allstak-baggage', allstakBaggage(traceId, requestId, spanId));
     setHeader(response, 'x-allstak-trace-id', traceId);
@@ -225,6 +267,10 @@ export class AllStakNestInterceptor {
     const finalize = (): void => {
       if (finalized) return;
       finalized = true;
+      // Trace-not-sampled: skip request + span emission for this trace. The
+      // propagated traceparent already carries the -00 flag so downstream
+      // services drop consistently.
+      if (!sampled) return;
       const durationMs = Math.max(0, Date.now() - startedAt);
       const path = pathOf(request);
       const method = request.method.toUpperCase();
@@ -323,6 +369,13 @@ export class AllStakNestExceptionFilter {
   catch(exception: unknown, context: ExecutionContextLike): never {
     const request = context.switchToHttp().getRequest<RequestLike>();
     const error = exception instanceof Error ? exception : new Error(String(exception));
+    // Error sampling: deterministic random drop at capture time, applied
+    // BEFORE beforeSend (dispatch). Dropped errors never reach beforeSend.
+    const sampleRate = clamp01(this.config.sampleRate);
+    const random = this.config.random || Math.random;
+    if (sampleRate < 1 && random() >= sampleRate) {
+      throw exception; // sampled out — still rethrow so Nest handles the response
+    }
     const payload: Record<string, unknown> = {
       exceptionClass: error.name || 'Error',
       message: error.message,
