@@ -12,8 +12,18 @@ import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { SDK_NAME, SDK_VERSION } from './version';
 import { compileExtra, isSensitiveKey, redactMap, REDACTED_VALUE } from './redaction';
 import { AllStakNestTransport } from './transport';
+import {
+  Scope,
+  ScopeManager,
+  type ScopeUser,
+  type ScopeBreadcrumb,
+  type Severity,
+  type MergedScopeData,
+} from './scope';
 
 export { SDK_NAME, SDK_VERSION } from './version';
+export { Scope } from './scope';
+export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
 
 /** Injection token used by AllStakModule.forRoot() to provide config. */
 export const ALLSTAK_OPTIONS = 'ALLSTAK_OPTIONS';
@@ -86,6 +96,8 @@ interface RequestLike {
   allstakSpanId?: string;
   allstakParentSpanId?: string;
   allstakSampled?: boolean;
+  /** Per-request scope, attached by the interceptor; read by the filter. */
+  allstakScope?: Scope;
 }
 
 interface ResponseLike {
@@ -218,6 +230,154 @@ async function dispatch(
   await transport.send(outbound.path, outbound.payload);
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Module-level manual capture + scope API
+//
+// The transport/config live inside the AllStakModule providers. To let
+// application code call captureException / setUser / withScope from anywhere,
+// the interceptor + filter register their resolved transport/config at module
+// scope on construction. Manual captures route through the SAME transport
+// (redaction + beforeSend via dispatch()) and merge the active scope.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Process-wide scope manager (ALS-backed request isolation + global scope). */
+const scopeManager = new ScopeManager();
+
+interface ActiveCaptureContext {
+  transport: AllStakNestTransport;
+  config: AllStakNestConfig;
+  extraRedact: RegExp[];
+}
+
+let activeContext: ActiveCaptureContext | null = null;
+
+function registerActiveContext(ctx: ActiveCaptureContext): void {
+  // Last registered wins; both interceptor and filter call this so a manual
+  // capture works whether or not the interceptor is active.
+  activeContext = ctx;
+}
+
+/** Flatten merged scope into a metadata bag (pre-redaction). */
+function scopeMetadata(merged: MergedScopeData): Record<string, unknown> {
+  const meta: Record<string, unknown> = {};
+  if (merged.user?.id != null) meta.userId = String(merged.user.id);
+  if (merged.user?.email != null) meta.userEmail = merged.user.email;
+  for (const [k, v] of Object.entries(merged.tags)) meta[`tag.${k}`] = v;
+  for (const [k, v] of Object.entries(merged.extras)) meta[`extra.${k}`] = v;
+  for (const [name, c] of Object.entries(merged.contexts)) meta[`context.${name}`] = c;
+  return meta;
+}
+
+/**
+ * Apply the active merged scope onto an error/http-request payload. Mutates and
+ * returns `payload`; metadata is re-run through redaction. Shared by manual
+ * captures and the auto-capture interceptor/filter.
+ */
+function applyScopeToPayload(
+  payload: Record<string, unknown>,
+  extraRedact: RegExp[],
+  merged: MergedScopeData,
+): Record<string, unknown> {
+  const baseMeta = (payload.metadata as Record<string, unknown> | undefined) ?? {};
+  payload.metadata = redactMap({ ...baseMeta, ...scopeMetadata(merged) }, extraRedact);
+  if (merged.level) payload.level = merged.level;
+  if (merged.fingerprint) payload.fingerprint = merged.fingerprint;
+  if (merged.breadcrumbs.length) payload.breadcrumbs = merged.breadcrumbs;
+  if (merged.user?.id != null && payload.userId === undefined) {
+    payload.userId = String(merged.user.id);
+  }
+  return payload;
+}
+
+/**
+ * Capture an exception on demand through the active module transport. Honors
+ * the same beforeSend + redaction pipeline as auto-capture and merges the
+ * current scope. No-op if AllStakModule was never registered.
+ */
+export function captureException(error: unknown, hint?: { extra?: Record<string, unknown>; level?: Severity }): void {
+  const ctx = activeContext;
+  if (!ctx) return;
+  const err = error instanceof Error ? error : new Error(String(error));
+  const payload: Record<string, unknown> = {
+    exceptionClass: err.name || 'Error',
+    message: err.message,
+    stackTrace: err.stack ? err.stack.split('\n') : [],
+    level: hint?.level ?? 'error',
+    environment: ctx.config.environment || '',
+    release: ctx.config.release || '',
+    metadata: {
+      'sdk.name': SDK_NAME,
+      'sdk.version': SDK_VERSION,
+      service: ctx.config.serviceName || '',
+      ...(hint?.extra ?? {}),
+    },
+  };
+  applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged());
+  void dispatch(ctx.transport, ctx.config, { path: '/ingest/v1/errors', payload });
+}
+
+/** Capture a freeform message on demand through the active module transport. */
+export function captureMessage(message: string, level: Severity = 'info'): void {
+  const ctx = activeContext;
+  if (!ctx) return;
+  const payload: Record<string, unknown> = {
+    exceptionClass: 'Message',
+    message,
+    stackTrace: [],
+    level,
+    environment: ctx.config.environment || '',
+    release: ctx.config.release || '',
+    metadata: {
+      'sdk.name': SDK_NAME,
+      'sdk.version': SDK_VERSION,
+      service: ctx.config.serviceName || '',
+    },
+  };
+  applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged());
+  void dispatch(ctx.transport, ctx.config, { path: '/ingest/v1/errors', payload });
+}
+
+/** Set the user on the active (request or global) scope. */
+export function setUser(user: ScopeUser | null): void {
+  scopeManager.getCurrentScope().setUser(user);
+}
+/** Set a single tag on the active scope. */
+export function setTag(key: string, value: string): void {
+  scopeManager.getCurrentScope().setTag(key, value);
+}
+/** Merge tags onto the active scope. */
+export function setTags(tags: Record<string, string>): void {
+  scopeManager.getCurrentScope().setTags(tags);
+}
+/** Set a single extra value on the active scope. */
+export function setExtra(key: string, value: unknown): void {
+  scopeManager.getCurrentScope().setExtra(key, value);
+}
+/** Merge extras onto the active scope. */
+export function setExtras(extras: Record<string, unknown>): void {
+  scopeManager.getCurrentScope().setExtras(extras);
+}
+/** Attach (or remove, with `null`) a named context bag on the active scope. */
+export function setContext(name: string, ctx: Record<string, unknown> | null): void {
+  scopeManager.getCurrentScope().setContext(name, ctx);
+}
+/** Add a breadcrumb to the active scope; attached to subsequently captured events. */
+export function addBreadcrumb(crumb: ScopeBreadcrumb): void {
+  scopeManager.getCurrentScope().addBreadcrumb(crumb);
+}
+/** Run `callback` with a forked scope that is popped afterwards (sync or async). */
+export function withScope<T>(callback: (scope: Scope) => T): T {
+  return scopeManager.withScope(callback);
+}
+/** Mutate the active scope in place. */
+export function configureScope(callback: (scope: Scope) => void): void {
+  scopeManager.configureScope(callback);
+}
+/** @internal — exposed for tests; returns the merged active scope view. */
+export function _getMergedScope(): MergedScopeData {
+  return scopeManager.getMerged();
+}
+
 @Injectable()
 export class AllStakNestInterceptor {
   private config: AllStakNestConfig;
@@ -236,10 +396,20 @@ export class AllStakNestInterceptor {
         fetch: this.config.fetch,
       });
     }
+    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact });
   }
 
   intercept(context: ExecutionContextLike, next: CallHandlerLike): unknown {
+    // Establish a fresh, request-isolated scope for the remainder of this
+    // request's async context so user/tags set in a controller (which runs
+    // downstream of next.handle() inside this async chain) don't leak across
+    // concurrent requests. We ALSO stash the same Scope instance on the request
+    // object: the exception filter and the response finalize hook read it from
+    // there, which is robust even if Nest invokes them in a sibling async
+    // context where ALS propagation would not reach.
+    const requestScope = scopeManager.enterRequestScope() ?? undefined;
     const request = context.switchToHttp().getRequest<RequestLike>();
+    request.allstakScope = requestScope;
     const response = context.switchToHttp().getResponse<ResponseLike>();
     const startedAt = Date.now();
     const parsed = parseTraceparent(headerValue(request.headers, 'traceparent'));
@@ -276,7 +446,9 @@ export class AllStakNestInterceptor {
       const method = request.method.toUpperCase();
       const statusCode = response.statusCode;
       const headerHost = request.headers.host;
-      const userId = request.user?.id == null ? undefined : String(request.user.id);
+      const merged = scopeManager.getMergedFor(request.allstakScope);
+      const scopeUserId = merged.user?.id == null ? undefined : String(merged.user.id);
+      const userId = scopeUserId ?? (request.user?.id == null ? undefined : String(request.user.id));
       const payload: Record<string, unknown> = {
         requests: [
           {
@@ -302,6 +474,7 @@ export class AllStakNestInterceptor {
               {
                 'sdk.name': SDK_NAME,
                 'sdk.version': SDK_VERSION,
+                ...scopeMetadata(merged),
               },
               this.extraRedact,
             ),
@@ -364,6 +537,7 @@ export class AllStakNestExceptionFilter {
         fetch: this.config.fetch,
       });
     }
+    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact });
   }
 
   catch(exception: unknown, context: ExecutionContextLike): never {
@@ -387,17 +561,18 @@ export class AllStakNestExceptionFilter {
       spanId: request.allstakSpanId || '',
       parentSpanId: request.allstakParentSpanId || '',
       requestId: request.allstakRequestId || '',
-      metadata: redactMap(
-        {
-          'sdk.name': SDK_NAME,
-          'sdk.version': SDK_VERSION,
-          service: this.config.serviceName || '',
-          httpMethod: request.method,
-          httpPath: pathOf(request),
-        },
-        this.extraRedact,
-      ),
+      metadata: {
+        'sdk.name': SDK_NAME,
+        'sdk.version': SDK_VERSION,
+        service: this.config.serviceName || '',
+        httpMethod: request.method,
+        httpPath: pathOf(request),
+      },
     };
+    // Merge the active request scope (user/tags/extras/contexts/breadcrumbs)
+    // and apply redaction. Read the scope off the request object (set by the
+    // interceptor) so it is correct regardless of async-context propagation.
+    applyScopeToPayload(payload, this.extraRedact, scopeManager.getMergedFor(request.allstakScope));
     void dispatch(this.transport!, this.config, { path: '/ingest/v1/errors', payload });
     throw exception;
   }
