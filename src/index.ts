@@ -12,6 +12,7 @@ import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { SDK_NAME, SDK_VERSION } from './version';
 import { compileExtra, isSensitiveKey, redactMap, REDACTED_VALUE } from './redaction';
 import { AllStakNestTransport } from './transport';
+import { resolveRelease, type GitRunner } from './release';
 import {
   Scope,
   ScopeManager,
@@ -24,6 +25,17 @@ import {
 export { SDK_NAME, SDK_VERSION } from './version';
 export { Scope } from './scope';
 export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
+export {
+  resolveRelease,
+  resolveGitRelease,
+  detectReleaseFromEnv,
+  isNodeRuntime,
+  defaultGitRunner,
+  RELEASE_ENV_VARS,
+  _resetReleaseCache,
+  type ResolveReleaseOptions,
+} from './release';
+export type { GitRunner } from './release';
 
 /** Injection token used by AllStakModule.forRoot() to provide config. */
 export const ALLSTAK_OPTIONS = 'ALLSTAK_OPTIONS';
@@ -40,6 +52,16 @@ export interface AllStakNestConfig {
   environment?: string;
   release?: string;
   serviceName?: string;
+  /**
+   * Auto-detect the release when `release` is not set: env vars
+   * (ALLSTAK_RELEASE, RAILWAY_GIT_COMMIT_SHA, RENDER_GIT_COMMIT, …), then local
+   * git at init (`git describe`/short SHA, Node runtime only, cached one-shot),
+   * then the SDK version so release is never empty. Default true. Set false to
+   * gate off the git lookup and version fallback (explicit/env still apply).
+   */
+  autoDetectRelease?: boolean;
+  /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
+  gitRunner?: GitRunner;
   /** Extra attribute key patterns to redact. Plain substrings or RegExp. */
   redactKeys?: (string | RegExp)[];
   /** If true, include redacted headers in inbound HTTP event. Default false. */
@@ -121,6 +143,20 @@ interface CallHandlerLike {
 
 function normalizeHost(host?: string): string {
   return (host || DEFAULT_HOST).replace(/\/$/, '');
+}
+
+/**
+ * Resolve the effective release for a config: explicit `release` > env vars >
+ * local git at init > SDK version. The git lookup is cached one-shot inside
+ * resolveRelease, so calling this from both the interceptor and filter is cheap.
+ */
+function releaseOf(config: AllStakNestConfig): string {
+  return resolveRelease({
+    explicit: config.release,
+    autoDetectRelease: config.autoDetectRelease,
+    gitRunner: config.gitRunner,
+    version: SDK_VERSION,
+  });
 }
 
 function pathOf(request: RequestLike): string {
@@ -247,6 +283,8 @@ interface ActiveCaptureContext {
   transport: AllStakNestTransport;
   config: AllStakNestConfig;
   extraRedact: RegExp[];
+  /** Release resolved once at registration (explicit > env > git > version). */
+  release: string;
 }
 
 let activeContext: ActiveCaptureContext | null = null;
@@ -304,7 +342,7 @@ export function captureException(error: unknown, hint?: { extra?: Record<string,
     stackTrace: err.stack ? err.stack.split('\n') : [],
     level: hint?.level ?? 'error',
     environment: ctx.config.environment || '',
-    release: ctx.config.release || '',
+    release: ctx.release,
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -326,7 +364,7 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
     stackTrace: [],
     level,
     environment: ctx.config.environment || '',
-    release: ctx.config.release || '',
+    release: ctx.release,
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -382,6 +420,7 @@ export function _getMergedScope(): MergedScopeData {
 export class AllStakNestInterceptor {
   private config: AllStakNestConfig;
   private extraRedact: RegExp[];
+  private release: string;
 
   constructor(
     @Optional() @Inject(ALLSTAK_OPTIONS) config?: AllStakNestConfig,
@@ -389,6 +428,7 @@ export class AllStakNestInterceptor {
   ) {
     this.config = config || {};
     this.extraRedact = compileExtra(this.config.redactKeys);
+    this.release = releaseOf(this.config);
     if (!this.transport) {
       this.transport = new AllStakNestTransport({
         host: normalizeHost(this.config.host || this.config.endpoint),
@@ -396,7 +436,7 @@ export class AllStakNestInterceptor {
         fetch: this.config.fetch,
       });
     }
-    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact });
+    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release });
   }
 
   intercept(context: ExecutionContextLike, next: CallHandlerLike): unknown {
@@ -464,7 +504,7 @@ export class AllStakNestInterceptor {
             parentSpanId: request.allstakParentSpanId || '',
             requestId,
             environment: this.config.environment || '',
-            release: this.config.release || '',
+            release: this.release,
             service: this.config.serviceName || '',
             userId,
             requestHeaders: this.config.captureRequestHeaders
@@ -498,7 +538,7 @@ export class AllStakNestInterceptor {
               endTimeMillis: startedAt + durationMs,
               service: this.config.serviceName || '',
               environment: this.config.environment || '',
-              release: this.config.release || '',
+              release: this.release,
               tags: {
                 component: 'nestjs',
                 method,
@@ -523,6 +563,7 @@ export class AllStakNestInterceptor {
 export class AllStakNestExceptionFilter {
   private config: AllStakNestConfig;
   private extraRedact: RegExp[];
+  private release: string;
 
   constructor(
     @Optional() @Inject(ALLSTAK_OPTIONS) config?: AllStakNestConfig,
@@ -530,6 +571,7 @@ export class AllStakNestExceptionFilter {
   ) {
     this.config = config || {};
     this.extraRedact = compileExtra(this.config.redactKeys);
+    this.release = releaseOf(this.config);
     if (!this.transport) {
       this.transport = new AllStakNestTransport({
         host: normalizeHost(this.config.host || this.config.endpoint),
@@ -537,7 +579,7 @@ export class AllStakNestExceptionFilter {
         fetch: this.config.fetch,
       });
     }
-    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact });
+    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release });
   }
 
   catch(exception: unknown, context: ExecutionContextLike): never {
@@ -556,7 +598,7 @@ export class AllStakNestExceptionFilter {
       stackTrace: error.stack ? error.stack.split('\n') : [],
       level: 'error',
       environment: this.config.environment || '',
-      release: this.config.release || '',
+      release: this.release,
       traceId: request.allstakTraceId || '',
       spanId: request.allstakSpanId || '',
       parentSpanId: request.allstakParentSpanId || '',
