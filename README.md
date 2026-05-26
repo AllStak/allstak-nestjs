@@ -60,7 +60,6 @@ AllStakModule.forRootAsync({
 | --- | --- |
 | `apiKey` | Project API key. |
 | `dsn` | Alias for `apiKey`. |
-| `host` | Optional ingest host override for self-hosted AllStak. |
 | `environment` | Deployment environment. |
 | `release` | App version or commit SHA. |
 | `serviceName` | Logical service name. |
