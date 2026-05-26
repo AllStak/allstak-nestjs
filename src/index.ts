@@ -43,6 +43,7 @@ export const ALLSTAK_OPTIONS = 'ALLSTAK_OPTIONS';
 export const ALLSTAK_TRANSPORT = 'ALLSTAK_TRANSPORT';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
+const runtimeReleaseRegistrations = new Set<string>();
 
 export interface AllStakNestConfig {
   apiKey?: string;
@@ -60,6 +61,11 @@ export interface AllStakNestConfig {
    * gate off the git lookup and version fallback (explicit/env still apply).
    */
   autoDetectRelease?: boolean;
+  /**
+   * Register the resolved release with AllStak from the server runtime at
+   * module startup, without requiring a CI/CD hook. Default true.
+   */
+  autoRegisterRelease?: boolean;
   /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
   gitRunner?: GitRunner;
   /** Extra attribute key patterns to redact. Plain substrings or RegExp. */
@@ -95,7 +101,7 @@ export interface AllStakNestConfig {
 }
 
 export interface AllStakOutboundEvent {
-  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans';
+  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans' | '/ingest/v1/releases';
   payload: Record<string, unknown>;
 }
 
@@ -157,6 +163,37 @@ function releaseOf(config: AllStakNestConfig): string {
     gitRunner: config.gitRunner,
     version: SDK_VERSION,
   });
+}
+
+function registerRuntimeRelease(
+  config: AllStakNestConfig,
+  transport: AllStakNestTransport,
+  release: string,
+): void {
+  if (!shouldAutoRegisterRelease(config.autoRegisterRelease) || !release) return;
+  const host = normalizeHost(config.host || config.endpoint);
+  const apiKey = config.apiKey || config.dsn || '';
+  if (!apiKey) return;
+  const environment = config.environment || 'production';
+  const key = `${host}|${apiKey}|${environment}|${release}`;
+  if (runtimeReleaseRegistrations.has(key)) return;
+  runtimeReleaseRegistrations.add(key);
+  void transport.send('/ingest/v1/releases', {
+    version: release,
+    environment,
+    author: `${SDK_NAME}/${SDK_VERSION}`,
+    message: 'Registered automatically by AllStak NestJS SDK at runtime',
+  });
+}
+
+function shouldAutoRegisterRelease(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  try {
+    return process.env.NODE_ENV !== 'test' && process.env.VITEST !== 'true';
+  } catch {
+    return true;
+  }
 }
 
 function pathOf(request: RequestLike): string {
@@ -416,6 +453,11 @@ export function _getMergedScope(): MergedScopeData {
   return scopeManager.getMerged();
 }
 
+/** @internal */
+export function _resetRuntimeReleaseRegistrationForTest(): void {
+  runtimeReleaseRegistrations.clear();
+}
+
 @Injectable()
 export class AllStakNestInterceptor {
   private config: AllStakNestConfig;
@@ -436,6 +478,7 @@ export class AllStakNestInterceptor {
         fetch: this.config.fetch,
       });
     }
+    registerRuntimeRelease(this.config, this.transport, this.release);
     registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release });
   }
 
@@ -579,6 +622,7 @@ export class AllStakNestExceptionFilter {
         fetch: this.config.fetch,
       });
     }
+    registerRuntimeRelease(this.config, this.transport, this.release);
     registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release });
   }
 
