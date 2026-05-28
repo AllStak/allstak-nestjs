@@ -1,6 +1,8 @@
 import {
   type DynamicModule,
   type FactoryProvider,
+  type OnApplicationShutdown,
+  type OnModuleInit,
   type Provider,
   type Type,
   Inject,
@@ -13,6 +15,7 @@ import { SDK_NAME, SDK_VERSION } from './version';
 import { compileExtra, isSensitiveKey, redactMap, REDACTED_VALUE } from './redaction';
 import { AllStakNestTransport } from './transport';
 import { resolveRelease, type GitRunner } from './release';
+import { SessionTracker } from './session';
 import {
   Scope,
   ScopeManager,
@@ -25,6 +28,8 @@ import {
 export { SDK_NAME, SDK_VERSION } from './version';
 export { Scope } from './scope';
 export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
+export { Session, SessionTracker } from './session';
+export type { SessionStatus } from './session';
 export {
   resolveRelease,
   resolveGitRelease,
@@ -53,6 +58,24 @@ export interface AllStakNestConfig {
   environment?: string;
   release?: string;
   serviceName?: string;
+  /**
+   * Platform identifier attached to the release-health session start payload.
+   * Defaults to `node` for this server SDK.
+   */
+  platform?: string;
+  /**
+   * User id attached to the release-health session start payload (when known
+   * at init). Per-request users are still derived from scope on error events.
+   */
+  userId?: string;
+  /**
+   * Open one release-health session per process at module startup
+   * (`/ingest/v1/sessions/start`) and close it on graceful shutdown
+   * (`/ingest/v1/sessions/end`), tracking ok/errored/crashed locally. Sessions
+   * are never sampled. Default true; set false to opt out. Skipped
+   * automatically under a unit-test runtime (NODE_ENV=test / VITEST).
+   */
+  enableAutoSessionTracking?: boolean;
   /**
    * Auto-detect the release when `release` is not set: env vars
    * (ALLSTAK_RELEASE, RAILWAY_GIT_COMMIT_SHA, RENDER_GIT_COMMIT, …), then local
@@ -196,6 +219,27 @@ function shouldAutoRegisterRelease(value: boolean | undefined): boolean {
   }
 }
 
+/** True only on a unit-test runtime (mirrors the release-registration guard). */
+function isLikelyTestRuntime(): boolean {
+  try {
+    return process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether release-health session tracking should run. Default true; explicit
+ * `false` opts out. Auto-skip under a unit-test runtime so tests don't open
+ * sessions against `/ingest/v1/sessions/start` (the createAllStak* test seams
+ * pass an explicit flag to exercise the behavior deterministically).
+ */
+function shouldTrackSessions(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  return !isLikelyTestRuntime();
+}
+
 function pathOf(request: RequestLike): string {
   const raw = request.originalUrl || request.url || '/';
   const i = raw.indexOf('?');
@@ -332,6 +376,48 @@ function registerActiveContext(ctx: ActiveCaptureContext): void {
   activeContext = ctx;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Release-health session lifecycle
+//
+// A single session is opened per process at module startup and closed on
+// graceful shutdown. The lifecycle provider owns the SessionTracker; the
+// exception filter / captureException mark it errored/crashed via the
+// module-level reference below (mirrors the Java SDK's recordError/recordCrash
+// wiring). Sessions are never sampled and the whole path is fail-open.
+// ───────────────────────────────────────────────────────────────────────────
+
+let activeSessionTracker: SessionTracker | null = null;
+
+function platformOf(config: AllStakNestConfig): string {
+  return config.platform || 'node';
+}
+
+/** Mark the active session errored (HANDLED) or crashed (UNHANDLED/fatal). */
+function recordSessionForLevel(level: Severity): void {
+  const tracker = activeSessionTracker;
+  if (!tracker) return;
+  try {
+    if (level === 'fatal') tracker.recordCrash();
+    else if (level === 'error') tracker.recordError();
+  } catch {
+    /* release-health must never break capture */
+  }
+}
+
+/** Resolve the current session id (if a session is active), for event payloads. */
+function currentSessionId(): string | undefined {
+  return activeSessionTracker?.current()?.id;
+}
+
+/** @internal — exposed for tests. */
+export function _getActiveSessionTracker(): SessionTracker | null {
+  return activeSessionTracker;
+}
+/** @internal — exposed for tests; clears the module-level tracker reference. */
+export function _resetSessionTrackerForTest(): void {
+  activeSessionTracker = null;
+}
+
 /** Flatten merged scope into a metadata bag (pre-redaction). */
 function scopeMetadata(merged: MergedScopeData): Record<string, unknown> {
   const meta: Record<string, unknown> = {};
@@ -373,13 +459,15 @@ export function captureException(error: unknown, hint?: { extra?: Record<string,
   const ctx = activeContext;
   if (!ctx) return;
   const err = error instanceof Error ? error : new Error(String(error));
+  const level: Severity = hint?.level ?? 'error';
   const payload: Record<string, unknown> = {
     exceptionClass: err.name || 'Error',
     message: err.message,
     stackTrace: err.stack ? err.stack.split('\n') : [],
-    level: hint?.level ?? 'error',
+    level,
     environment: ctx.config.environment || '',
     release: ctx.release,
+    sessionId: currentSessionId(),
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -388,6 +476,9 @@ export function captureException(error: unknown, hint?: { extra?: Record<string,
     },
   };
   applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged());
+  // Release-health: a manual captureException is a HANDLED error (or a fatal
+  // one if the caller marked it). Mirrors the reference SessionTracker model.
+  recordSessionForLevel(level);
   void dispatch(ctx.transport, ctx.config, { path: '/ingest/v1/errors', payload });
 }
 
@@ -402,6 +493,7 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
     level,
     environment: ctx.config.environment || '',
     release: ctx.release,
+    sessionId: currentSessionId(),
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -409,6 +501,7 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
     },
   };
   applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged());
+  recordSessionForLevel(level);
   void dispatch(ctx.transport, ctx.config, { path: '/ingest/v1/errors', payload });
 }
 
@@ -643,6 +736,7 @@ export class AllStakNestExceptionFilter {
       level: 'error',
       environment: this.config.environment || '',
       release: this.release,
+      sessionId: currentSessionId(),
       traceId: request.allstakTraceId || '',
       spanId: request.allstakSpanId || '',
       parentSpanId: request.allstakParentSpanId || '',
@@ -659,6 +753,10 @@ export class AllStakNestExceptionFilter {
     // and apply redaction. Read the scope off the request object (set by the
     // interceptor) so it is correct regardless of async-context propagation.
     applyScopeToPayload(payload, this.extraRedact, scopeManager.getMergedFor(request.allstakScope));
+    // Release-health: a request that reached the global exception filter is a
+    // HANDLED error from the process's perspective (Nest returns a 500 and the
+    // process keeps running) ⇒ mark the session errored, not crashed.
+    recordSessionForLevel('error');
     void dispatch(this.transport!, this.config, { path: '/ingest/v1/errors', payload });
     throw exception;
   }
@@ -670,6 +768,78 @@ export function createAllStakNestInterceptor(config: AllStakNestConfig): AllStak
 
 export function createAllStakNestExceptionFilter(config: AllStakNestConfig): AllStakNestExceptionFilter {
   return new AllStakNestExceptionFilter(config);
+}
+
+/**
+ * Owns the per-process release-health session. Opens it on module init
+ * (`/ingest/v1/sessions/start`) and closes it on graceful shutdown
+ * (`/ingest/v1/sessions/end`). Registered as a Nest provider by
+ * AllStakModule.forRoot(); shutdown firing requires `app.enableShutdownHooks()`
+ * in the host app. Fully fail-open: nothing here throws into init/shutdown.
+ */
+@Injectable()
+export class AllStakSessionLifecycle implements OnModuleInit, OnApplicationShutdown {
+  private config: AllStakNestConfig;
+  private release: string;
+  private tracker: SessionTracker | null = null;
+
+  constructor(
+    @Optional() @Inject(ALLSTAK_OPTIONS) config?: AllStakNestConfig,
+    @Optional() @Inject(ALLSTAK_TRANSPORT) private readonly transport?: AllStakNestTransport,
+  ) {
+    this.config = config || {};
+    this.release = releaseOf(this.config);
+    if (!this.transport) {
+      this.transport = new AllStakNestTransport({
+        host: normalizeHost(this.config.host || this.config.endpoint),
+        apiKey: this.config.apiKey || this.config.dsn || '',
+        fetch: this.config.fetch,
+      });
+    }
+  }
+
+  onModuleInit(): void {
+    try {
+      if (!shouldTrackSessions(this.config.enableAutoSessionTracking)) return;
+      this.tracker = new SessionTracker(
+        {
+          // Release falls back to the SDK version upstream (resolveRelease),
+          // so a non-empty release is the norm; an empty release keeps the
+          // in-memory tracker but skips the network call.
+          release: this.release,
+          environment: this.config.environment,
+          userId: this.config.userId,
+          sdkName: SDK_NAME,
+          sdkVersion: SDK_VERSION,
+          platform: platformOf(this.config),
+        },
+        this.transport!,
+      );
+      activeSessionTracker = this.tracker;
+      this.tracker.start();
+    } catch {
+      /* session tracking must never block module init */
+    }
+  }
+
+  onApplicationShutdown(): void {
+    try {
+      this.tracker?.end();
+    } catch {
+      /* best-effort, must not throw on shutdown */
+    } finally {
+      if (activeSessionTracker === this.tracker) activeSessionTracker = null;
+    }
+  }
+}
+
+/**
+ * Build a standalone session lifecycle for tests / manual wiring. The returned
+ * instance is NOT auto-started; call `onModuleInit()` to start and
+ * `onApplicationShutdown()` to end (mirroring Nest's lifecycle invocation).
+ */
+export function createAllStakNestSessionLifecycle(config: AllStakNestConfig): AllStakSessionLifecycle {
+  return new AllStakSessionLifecycle(config);
 }
 
 function transportProvider(): FactoryProvider {
@@ -694,6 +864,7 @@ export class AllStakModule {
       transportProvider(),
       { provide: APP_INTERCEPTOR, useClass: AllStakNestInterceptor },
       { provide: APP_FILTER, useClass: AllStakNestExceptionFilter },
+      AllStakSessionLifecycle,
     ];
     return {
       module: AllStakModule,
@@ -733,6 +904,7 @@ export class AllStakModule {
         transportProvider(),
         { provide: APP_INTERCEPTOR, useClass: AllStakNestInterceptor },
         { provide: APP_FILTER, useClass: AllStakNestExceptionFilter },
+        AllStakSessionLifecycle,
       ],
       exports: [ALLSTAK_OPTIONS, ALLSTAK_TRANSPORT],
     };

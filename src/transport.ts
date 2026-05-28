@@ -68,6 +68,19 @@ export class AllStakNestTransport {
         let body: string;
         try {
           const scrubbed = redactMap(payload as Record<string, unknown>) ?? payload;
+          // `sessionId` is a release-health correlation id (NOT an auth/session
+          // token), but the default denylist redacts `session*id` because in
+          // headers/cookies a "session id" is sensitive. Restore the top-level
+          // release-health field so the backend can attribute the session;
+          // nested/metadata/header session-ids stay redacted.
+          if (
+            scrubbed &&
+            payload &&
+            typeof payload === 'object' &&
+            typeof (payload as Record<string, unknown>).sessionId === 'string'
+          ) {
+            (scrubbed as Record<string, unknown>).sessionId = (payload as Record<string, unknown>).sessionId;
+          }
           body = JSON.stringify(scrubbed);
         } catch {
           body = JSON.stringify(payload);

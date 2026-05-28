@@ -65,6 +65,18 @@ AllStakModule.forRootAsync({
 | `serviceName` | Logical service name. |
 | `captureRequestHeaders` | Capture redacted inbound headers. Default: `false`. |
 | `beforeSend` | Optional hook to modify or drop outbound telemetry. |
+| `enableAutoSessionTracking` | Open one release-health session per process on startup and close it on shutdown. Default: `true`. |
+| `platform` | Platform tag on the session start payload. Default: `node`. |
+| `userId` | User id attached to the session start payload when known at init. |
+
+## Release health
+
+`AllStakModule.forRoot(...)` opens a single release-health session per process
+on module init (`/ingest/v1/sessions/start`) and closes it on graceful shutdown
+(`/ingest/v1/sessions/end`) with the final status (`ok` / `errored` / `crashed`).
+Sessions are never sampled and the whole path is fail-open. Call
+`app.enableShutdownHooks()` so the closing event fires. Set
+`enableAutoSessionTracking: false` to opt out.
 
 ## Privacy
 
