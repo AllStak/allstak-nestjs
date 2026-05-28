@@ -68,6 +68,8 @@ AllStakModule.forRootAsync({
 | `enableAutoSessionTracking` | Open one release-health session per process on startup and close it on shutdown. Default: `true`. |
 | `platform` | Platform tag on the session start payload. Default: `node`. |
 | `userId` | User id attached to the session start payload when known at init. |
+| `enableOfflineQueue` | Persist undeliverable telemetry to a bounded filesystem spool and replay it on the next init. Default: `true`. |
+| `offlineQueueDir` | Spool directory. Default: `<os.tmpdir()>/allstak-nestjs-spool`. |
 
 ## Release health
 
@@ -77,6 +79,22 @@ on module init (`/ingest/v1/sessions/start`) and closes it on graceful shutdown
 Sessions are never sampled and the whole path is fail-open. Call
 `app.enableShutdownHooks()` so the closing event fires. Set
 `enableAutoSessionTracking: false` to opt out.
+
+## Offline queue
+
+When telemetry cannot be delivered (network outage, retry exhausted, or the
+process shuts down with events still buffered) the SDK persists the
+**already-redacted** wire body to a bounded filesystem spool
+(`<os.tmpdir()>/allstak-nestjs-spool` by default) instead of dropping it. On the
+next init it asynchronously drains the spool and re-sends each entry through the
+normal transport, removing it only once accepted (2xx) or permanently
+undeliverable (a 4xx other than 429). The spool is bounded by count, total
+bytes, and max age, evicting the oldest entries first. Session lifecycle calls
+(`/sessions/start`, `/sessions/end`) are live-only and never persisted. If the
+spool directory is not writable (read-only FS, serverless, edge runtime with no
+`fs`) the SDK degrades silently to in-memory — it never throws or blocks init.
+Set `enableOfflineQueue: false` to opt out, or `offlineQueueDir` to point at a
+durable path.
 
 ## Privacy
 

@@ -30,6 +30,9 @@ export { Scope } from './scope';
 export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
 export { Session, SessionTracker } from './session';
 export type { SessionStatus } from './session';
+export { EventSpool } from './persistence';
+export type { SpoolOptions, SpooledEnvelope } from './persistence';
+export type { OfflineQueueOptions, TransportOptions } from './transport';
 export {
   resolveRelease,
   resolveGitRelease,
@@ -121,6 +124,23 @@ export interface AllStakNestConfig {
   random?: () => number;
   /** Override fetch (test injection). */
   fetch?: typeof fetch;
+  /**
+   * Persist undeliverable telemetry (errors/logs/spans/http/db) to a bounded
+   * filesystem spool so buffered events survive a process restart AND a network
+   * outage, then replay them on the next init through the normal transport
+   * (respecting retry/backoff). Session lifecycle calls are never persisted
+   * (live-only). Default true on this server runtime; set false to opt out and
+   * keep the existing in-memory drop-on-overflow behaviour. If the spool dir is
+   * not writable (read-only FS, serverless, edge runtime with no `fs`) the SDK
+   * degrades silently to in-memory — it never throws or blocks init.
+   */
+  enableOfflineQueue?: boolean;
+  /**
+   * Directory for the offline spool. Defaults to
+   * `<os.tmpdir()>/allstak-nestjs-spool`. Set to point at a durable path (e.g.
+   * a writable volume) if tmpdir is wiped on restart.
+   */
+  offlineQueueDir?: string;
 }
 
 export interface AllStakOutboundEvent {
@@ -172,6 +192,17 @@ interface CallHandlerLike {
 
 function normalizeHost(host?: string): string {
   return (host || DEFAULT_HOST).replace(/\/$/, '');
+}
+
+/**
+ * Translate the public config into the transport's offline-queue option.
+ * `enableOfflineQueue=false` disables persistence entirely; otherwise the spool
+ * is enabled (default) with the optional `offlineQueueDir` override. The
+ * transport itself degrades to in-memory if the dir is not writable.
+ */
+function offlineQueueOf(config: AllStakNestConfig): { enabled?: boolean; dir?: string } {
+  if (config.enableOfflineQueue === false) return { enabled: false };
+  return { enabled: true, dir: config.offlineQueueDir };
 }
 
 /**
@@ -569,6 +600,7 @@ export class AllStakNestInterceptor {
         host: normalizeHost(this.config.host || this.config.endpoint),
         apiKey: this.config.apiKey || this.config.dsn || '',
         fetch: this.config.fetch,
+        offlineQueue: offlineQueueOf(this.config),
       });
     }
     registerRuntimeRelease(this.config, this.transport, this.release);
@@ -713,6 +745,7 @@ export class AllStakNestExceptionFilter {
         host: normalizeHost(this.config.host || this.config.endpoint),
         apiKey: this.config.apiKey || this.config.dsn || '',
         fetch: this.config.fetch,
+        offlineQueue: offlineQueueOf(this.config),
       });
     }
     registerRuntimeRelease(this.config, this.transport, this.release);
@@ -794,6 +827,7 @@ export class AllStakSessionLifecycle implements OnModuleInit, OnApplicationShutd
         host: normalizeHost(this.config.host || this.config.endpoint),
         apiKey: this.config.apiKey || this.config.dsn || '',
         fetch: this.config.fetch,
+        offlineQueue: offlineQueueOf(this.config),
       });
     }
   }
@@ -851,6 +885,7 @@ function transportProvider(): FactoryProvider {
         host: normalizeHost(cfg.host || cfg.endpoint),
         apiKey: cfg.apiKey || cfg.dsn || '',
         fetch: cfg.fetch,
+        offlineQueue: offlineQueueOf(cfg),
       }),
   };
 }
