@@ -76,6 +76,12 @@ Sensitive header and metadata keys are redacted before telemetry is sent. Add `r
 - No errors: confirm no custom exception filter is swallowing exceptions before global filters run.
 - Missing correlation: preserve incoming `traceparent`, `baggage`, and `x-request-id` headers at your proxy.
 
+## Contributing and Support
+
+- Report bugs with the GitHub bug report template: https://github.com/AllStak/allstak-nestjs/issues/new/choose
+- Open pull requests using the checklist in [CONTRIBUTING.md](CONTRIBUTING.md).
+- Report security vulnerabilities privately through [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT
