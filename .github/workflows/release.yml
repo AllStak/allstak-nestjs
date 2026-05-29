@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Pack and smoke only; do not publish'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    name: Build, inspect, publish
+    runs-on: ubuntu-latest
+    environment: release-prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Verify package version
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
+              exit 1
+            fi
+          fi
+      - name: Check existing npm version
+        id: published
+        run: |
+          PKG_NAME="$(node -p "require('./package.json').name")"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Pack and inspect
+        run: |
+          mkdir -p pack
+          npm pack --json --pack-destination pack > pack/pack.json
+          TARBALL="$(node -e "const p=require('./pack/pack.json'); console.log('pack/'+p[0].filename)")"
+          tar -tf "$TARBALL" | tee pack/contents.txt
+          if grep -E '(^|/)(\.env|\.env\..*|\.npmrc|id_rsa|.*\.pem|.*\.key|.*\.crt)$' pack/contents.txt; then
+            echo "::error::Package tarball contains a forbidden secret-like file"
+            exit 1
+          fi
+          realpath "$TARBALL" > pack/tarball-path.txt
+      - name: Clean install smoke
+        run: |
+          TARBALL="$(cat pack/tarball-path.txt)"
+          TMP="$(mktemp -d)"
+          cp "$TARBALL" "$TMP/package.tgz"
+          cd "$TMP"
+          npm init -y >/dev/null
+          npm install --ignore-scripts ./package.tgz typescript @types/node @nestjs/common rxjs reflect-metadata >/dev/null
+          node -e "const sdk=require('@allstak/nestjs'); if (!sdk.AllStakNestInterceptor) throw new Error('missing CJS export')"
+          node --input-type=module -e "const sdk=await import('@allstak/nestjs'); if (!sdk.AllStakNestInterceptor) throw new Error('missing ESM export')"
+          printf "import { AllStakNestInterceptor } from '@allstak/nestjs';\nvoid AllStakNestInterceptor;\n" > smoke.ts
+          npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 --types node smoke.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: pack/
+      - name: Publish to npm
+        if: steps.published.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: 'true'
+        run: |
+          TARBALL="$(cat pack/tarball-path.txt)"
+          npm publish "$TARBALL" --access public --tag beta --provenance
+      - name: Verify published package
+        if: steps.published.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false)
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TMP="$(mktemp -d)"
+          cd "$TMP"
+          npm init -y >/dev/null
+          npm install "@allstak/nestjs@$PKG_VERSION" @nestjs/common rxjs reflect-metadata >/dev/null
+          node -e "const sdk=require('@allstak/nestjs'); if (!sdk.AllStakNestInterceptor) throw new Error('published package missing CJS export')"

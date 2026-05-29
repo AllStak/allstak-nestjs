@@ -1,6 +1,6 @@
 {
   "name": "@allstak/nestjs",
-  "version": "0.1.0-beta.4",
+  "version": "0.1.0",
   "description": "AllStak SDK for NestJS (beta). Global interceptor + exception filter with redaction, beforeSend, and forRootAsync for ConfigService.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -52,7 +52,7 @@
     "vitest": "^1.6.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "license": "MIT"
 }

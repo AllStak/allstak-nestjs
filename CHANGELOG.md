@@ -4,7 +4,7 @@ All notable changes to @allstak/nestjs will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [Unreleased]## [0.1.0] — 2026-05-29
 
 This entry collects the feature waves landed on top of `0.1.0-beta.3`. They are
 staged in the manifest under `0.1.0-beta.4`; the release version is chosen at the
