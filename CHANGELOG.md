@@ -38,11 +38,11 @@ publish gate.
   and `TransportOptions`.
 
 ### Added — Value-pattern PII scrubbing + `sendDefaultPii`
-- `redaction.ts` adds value-pattern scrubbing (Sentry data-scrubbing parity) over string
+- `redaction.ts` adds value-pattern scrubbing (data-scrubbing parity) over string
   VALUES regardless of key, on top of the existing key-pattern redaction. Credit-card
   numbers that pass the Luhn checksum and hyphenated US SSNs are ALWAYS scrubbed; email
   addresses and IPv4/IPv6 literals are scrubbed UNLESS `sendDefaultPii === true`.
-- New `sendDefaultPii` config (default `false`, matching Sentry). When `false`, auto-collected
+- New `sendDefaultPii` config (default `false`, matching). When `false`, auto-collected
   client IP is dropped/masked; when `true`, the email/IP value scrubbers are disabled and
   client IP is allowed through. Explicit `setUser({ id, email, … })` identity is ALWAYS sent
   verbatim regardless of the flag. The value scrubber is recursion-bounded and fail-open.
