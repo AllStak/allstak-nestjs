@@ -24,6 +24,21 @@ import {
   type Severity,
   type MergedScopeData,
 } from './scope';
+import {
+  TraceContextManager,
+  allstakBaggage,
+  clamp01,
+  formatTraceparent,
+  mergeBaggage,
+  parseTraceparent,
+  randomHex,
+} from './tracing';
+import {
+  installFetchInstrumentation,
+  instrumentAxiosInstance,
+  type OutboundConfig,
+  type OutboundDeps,
+} from './outbound';
 
 export { SDK_NAME, SDK_VERSION } from './version';
 export { Scope } from './scope';
@@ -46,6 +61,13 @@ export {
 export type { GitRunner } from './release';
 export { scrubString, scrubValues } from './redaction';
 export type { ValueScrubOptions } from './redaction';
+export {
+  installFetchInstrumentation,
+  instrumentAxiosInstance,
+} from './outbound';
+export type { OutboundConfig, OutboundDeps, OutboundSink } from './outbound';
+export { TraceContextManager } from './tracing';
+export type { TraceContext } from './tracing';
 
 /** Injection token used by AllStakModule.forRoot() to provide config. */
 export const ALLSTAK_OPTIONS = 'ALLSTAK_OPTIONS';
@@ -161,6 +183,15 @@ export interface AllStakNestConfig {
    * a writable volume) if tmpdir is wiped on restart.
    */
   offlineQueueDir?: string;
+  /**
+   * Instrument OUTBOUND HTTP so distributed traces survive the first downstream
+   * hop. When enabled (default true) the SDK wraps the global `fetch` to inject
+   * W3C `traceparent` + `baggage` continuing the active request trace, and emits
+   * a client span + an HttpRequestPayload(direction:'outbound') for each egress
+   * call. The SDK's own ingest host is always skipped. Set false to opt out.
+   * Skipped automatically under a unit-test runtime unless explicitly enabled.
+   */
+  enableOutboundHttp?: boolean;
 }
 
 export interface AllStakOutboundEvent {
@@ -291,6 +322,78 @@ function shouldTrackSessions(value: boolean | undefined): boolean {
   return !isLikelyTestRuntime();
 }
 
+/**
+ * Whether outbound HTTP instrumentation should be installed. Default true;
+ * explicit `false` opts out. Auto-skip under a unit-test runtime so global-fetch
+ * wrapping doesn't bleed across suites; tests opt back in with an explicit flag.
+ */
+function shouldInstrumentOutbound(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  return !isLikelyTestRuntime();
+}
+
+/** Build the OutboundConfig from a resolved config + release + pii decision. */
+function outboundConfigOf(config: AllStakNestConfig, release: string, sendDefaultPii: boolean): OutboundConfig {
+  return {
+    ingestHost: normalizeHost(config.host || config.endpoint),
+    serviceName: config.serviceName || '',
+    environment: config.environment || '',
+    release,
+    sendDefaultPii,
+  };
+}
+
+/**
+ * Build the OutboundDeps wiring the instrumentation to the active module's
+ * transport/config dispatch pipeline + the active trace context + the module's
+ * value-pattern scrubber. Reuses dispatch() so beforeSend + redaction still run.
+ */
+function outboundDepsOf(
+  transport: AllStakNestTransport,
+  config: AllStakNestConfig,
+  sendDefaultPii: boolean,
+): OutboundDeps {
+  return {
+    traceContext: traceContextManager,
+    scrub: (s: string) => String(scrubMessage(s, sendDefaultPii)),
+    dispatch: (path, payload) =>
+      void dispatch(transport, config, { path: path as AllStakOutboundEvent['path'], payload }),
+  };
+}
+
+/** Idempotency guard so multiple provider constructions install fetch once. */
+let outboundFetchInstalled = false;
+
+/**
+ * Install the global-fetch outbound instrumentation once, gated by config.
+ * Fail-open. Records nothing on the request object; the wrapper reads the active
+ * trace from the ALS the interceptor populates.
+ */
+function maybeInstallOutboundFetch(
+  config: AllStakNestConfig,
+  transport: AllStakNestTransport,
+  release: string,
+  sendDefaultPii: boolean,
+): void {
+  if (outboundFetchInstalled) return;
+  if (!shouldInstrumentOutbound(config.enableOutboundHttp)) return;
+  try {
+    installFetchInstrumentation(
+      outboundConfigOf(config, release, sendDefaultPii),
+      outboundDepsOf(transport, config, sendDefaultPii),
+    );
+    outboundFetchInstalled = true;
+  } catch {
+    /* instrumentation install must never break module init */
+  }
+}
+
+/** @internal — exposed for tests; resets the install guard. */
+export function _resetOutboundInstallForTest(): void {
+  outboundFetchInstalled = false;
+}
+
 function pathOf(request: RequestLike): string {
   const raw = request.originalUrl || request.url || '/';
   const i = raw.indexOf('?');
@@ -300,64 +403,6 @@ function pathOf(request: RequestLike): string {
 function headerValue(headers: RequestLike['headers'], name: string): string {
   const value = headers[name] ?? headers[name.toLowerCase()];
   return Array.isArray(value) ? value[0] || '' : value || '';
-}
-
-function randomHex(bytes: number): string {
-  const c = globalThis.crypto;
-  if (c?.getRandomValues) {
-    const data = new Uint8Array(bytes);
-    c.getRandomValues(data);
-    return Array.from(data, (b) => b.toString(16).padStart(2, '0')).join('');
-  }
-  return Array.from({ length: bytes }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('');
-}
-
-function parseTraceparent(value: string): {
-  traceId?: string;
-  parentSpanId?: string;
-  sampled?: boolean;
-} {
-  const parts = value.split('-');
-  if (parts.length < 4) return {};
-  const flags = parts[3];
-  // trace-flags is a 2-hex-digit field; bit 0 is the "sampled" flag.
-  const sampled = /^[0-9a-fA-F]{2}$/.test(flags ?? '')
-    ? (parseInt(flags, 16) & 0x01) === 0x01
-    : undefined;
-  return {
-    traceId: parts[1]?.length === 32 ? parts[1] : undefined,
-    parentSpanId: parts[2]?.length === 16 ? parts[2] : undefined,
-    sampled,
-  };
-}
-
-function traceparent(traceId: string, spanId: string, sampled: boolean): string {
-  const t = traceId.length === 32 ? traceId : randomHex(16);
-  const s = spanId.length === 16 ? spanId : randomHex(8);
-  return `00-${t}-${s}-${sampled ? '01' : '00'}`;
-}
-
-function clamp01(n: number | undefined): number {
-  if (typeof n !== 'number' || !Number.isFinite(n)) return 1;
-  if (n < 0) return 0;
-  if (n > 1) return 1;
-  return n;
-}
-
-function allstakBaggage(traceId: string, requestId: string, spanId: string): string {
-  return [
-    `allstak-trace_id=${traceId}`,
-    `allstak-request_id=${requestId}`,
-    `allstak-span_id=${spanId}`,
-  ].join(',');
-}
-
-function mergeBaggage(existing: string, traceId: string, requestId: string, spanId: string): string {
-  const preserved = existing
-    .split(',')
-    .map((part) => part.trim())
-    .filter((part) => part && !part.toLowerCase().startsWith('allstak-'));
-  return [...preserved, ...allstakBaggage(traceId, requestId, spanId).split(',')].join(',');
 }
 
 function setHeader(response: ResponseLike, name: string, value: string): void {
@@ -410,6 +455,13 @@ async function dispatch(
 
 /** Process-wide scope manager (ALS-backed request isolation + global scope). */
 const scopeManager = new ScopeManager();
+
+/**
+ * Process-wide active-trace context (ALS-backed). The interceptor publishes the
+ * current request's trace here; the outbound HTTP instrumentation reads it so an
+ * egress span continues the in-flight request trace as a child span.
+ */
+const traceContextManager = new TraceContextManager();
 
 interface ActiveCaptureContext {
   transport: AllStakNestTransport;
@@ -656,6 +708,36 @@ export function _getMergedScope(): MergedScopeData {
   return scopeManager.getMerged();
 }
 
+/**
+ * Instrument a @nestjs/axios `HttpService` (or any object exposing `axiosRef`,
+ * or a raw axios instance) so outbound axios requests inject W3C trace headers
+ * and emit an outbound HttpRequestPayload + client span — the axios counterpart
+ * to the global-fetch wrapper. @nestjs/axios is an OPTIONAL/peer integration:
+ * this SDK never imports it, the host passes its HttpService in.
+ *
+ * Idempotent per axios instance and fully fail-open. Returns true when the
+ * instance was instrumented. No-op (returns false) when AllStakModule was not
+ * registered, when `enableOutboundHttp` is disabled, or when the object does not
+ * look like an axios instance.
+ */
+export function instrumentHttpService(httpService: unknown): boolean {
+  const ctx = activeContext;
+  if (!ctx) return false;
+  if (!shouldInstrumentOutbound(ctx.config.enableOutboundHttp)) return false;
+  // Accept a NestJS HttpService (`.axiosRef`) or a raw axios instance.
+  const axios =
+    (httpService as { axiosRef?: unknown } | null | undefined)?.axiosRef ?? httpService;
+  try {
+    return instrumentAxiosInstance(
+      axios as Parameters<typeof instrumentAxiosInstance>[0],
+      outboundConfigOf(ctx.config, ctx.release, ctx.sendDefaultPii),
+      outboundDepsOf(ctx.transport, ctx.config, ctx.sendDefaultPii),
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** @internal */
 export function _resetRuntimeReleaseRegistrationForTest(): void {
   runtimeReleaseRegistrations.clear();
@@ -686,6 +768,9 @@ export class AllStakNestInterceptor {
     }
     registerRuntimeRelease(this.config, this.transport, this.release);
     registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release, sendDefaultPii: this.sendDefaultPii });
+    // Outbound HTTP instrumentation: wrap global fetch so egress propagates the
+    // trace + emits an outbound HttpRequestPayload. Installed once, fail-open.
+    maybeInstallOutboundFetch(this.config, this.transport, this.release, this.sendDefaultPii);
   }
 
   intercept(context: ExecutionContextLike, next: CallHandlerLike): unknown {
@@ -716,7 +801,11 @@ export class AllStakNestInterceptor {
     request.allstakSpanId = spanId;
     request.allstakSampled = sampled;
     request.allstakParentSpanId = headerValue(request.headers, 'x-allstak-parent-span-id') || parsed.parentSpanId;
-    setHeader(response, 'traceparent', traceparent(traceId, spanId, sampled));
+    // Publish the active trace into ALS for the rest of this request's async
+    // chain so outbound HTTP calls (fetch/axios) become children of this trace.
+    // enterWith mirrors the scope ALS hook; no-ops when ALS is unavailable.
+    traceContextManager.enterWith({ traceId, spanId, requestId, sampled });
+    setHeader(response, 'traceparent', formatTraceparent(traceId, spanId, sampled));
     setHeader(response, 'baggage', mergeBaggage(headerValue(request.headers, 'baggage'), traceId, requestId, spanId));
     setHeader(response, 'allstak-baggage', allstakBaggage(traceId, requestId, spanId));
     setHeader(response, 'x-allstak-trace-id', traceId);
