@@ -12,7 +12,7 @@ import {
 } from '@nestjs/common';
 import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { SDK_NAME, SDK_VERSION } from './version';
-import { compileExtra, isSensitiveKey, redactMap, REDACTED_VALUE } from './redaction';
+import { compileExtra, isSensitiveKey, redactMap, REDACTED_VALUE, scrubString, scrubValues } from './redaction';
 import { AllStakNestTransport } from './transport';
 import { resolveRelease, type GitRunner } from './release';
 import { SessionTracker } from './session';
@@ -44,6 +44,8 @@ export {
   type ResolveReleaseOptions,
 } from './release';
 export type { GitRunner } from './release';
+export { scrubString, scrubValues } from './redaction';
+export type { ValueScrubOptions } from './redaction';
 
 /** Injection token used by AllStakModule.forRoot() to provide config. */
 export const ALLSTAK_OPTIONS = 'ALLSTAK_OPTIONS';
@@ -96,6 +98,24 @@ export interface AllStakNestConfig {
   gitRunner?: GitRunner;
   /** Extra attribute key patterns to redact. Plain substrings or RegExp. */
   redactKeys?: (string | RegExp)[];
+  /**
+   * Send personally-identifiable information that the SDK would otherwise scrub
+   * from free-text values. Default FALSE (matches Sentry's `sendDefaultPii`
+   * default and is the privacy-safe choice).
+   *
+   * - `false` (default): email addresses and IPv4/IPv6 literals found inside
+   *   string VALUES (error messages, extras/contexts, breadcrumbs, captured
+   *   request fields) are replaced with `[REDACTED]`, and any auto-collected
+   *   client IP the SDK attaches is dropped/masked.
+   * - `true`: the caller has opted into PII, so those email/IP value scrubbers
+   *   are disabled and auto-collected client IP is allowed through.
+   *
+   * High-risk financial/identity data (credit-card numbers that pass the Luhn
+   * checksum, and hyphenated US SSNs) is ALWAYS scrubbed regardless of this
+   * flag, and explicit `setUser({ id, email, ... })` identity is ALWAYS sent
+   * verbatim regardless of this flag (it is intentional identification).
+   */
+  sendDefaultPii?: boolean;
   /** If true, include redacted headers in inbound HTTP event. Default false. */
   captureRequestHeaders?: boolean;
   /**
@@ -397,6 +417,8 @@ interface ActiveCaptureContext {
   extraRedact: RegExp[];
   /** Release resolved once at registration (explicit > env > git > version). */
   release: string;
+  /** Resolved sendDefaultPii at registration (gates email/IP value scrubbing). */
+  sendDefaultPii: boolean;
 }
 
 let activeContext: ActiveCaptureContext | null = null;
@@ -449,6 +471,56 @@ export function _resetSessionTrackerForTest(): void {
   activeSessionTracker = null;
 }
 
+/**
+ * Whether the caller opted into PII (Sentry `sendDefaultPii`). Default false =
+ * privacy-safe parity: the email/IP value scrubbers run and auto-collected IP
+ * is dropped. (A)-tier scrubbing (CC/SSN) is always on regardless.
+ */
+function sendDefaultPiiOf(config: AllStakNestConfig): boolean {
+  return config.sendDefaultPii === true;
+}
+
+/**
+ * Metadata keys carrying EXPLICIT identity set via setUser(). These are
+ * intentional identification (Sentry never strips explicitly-set user data), so
+ * they are exempt from value-pattern scrubbing — they still ship verbatim even
+ * when sendDefaultPii is false. They are NOT exempt from KEY-based redaction.
+ */
+const VALUE_SCRUB_EXEMPT_KEYS: ReadonlySet<string> = new Set(['userId', 'userEmail']);
+
+/**
+ * Value-scrub a metadata bag in place-safe fashion: returns a copy with PII in
+ * string VALUES redacted per sendDefaultPii, while exempting explicit-user
+ * identity keys. Fail-open: any scrubber error yields the unscrubbed input so an
+ * event is never dropped over a value-scan failure.
+ */
+function scrubMetadata(meta: Record<string, unknown>, sendDefaultPii: boolean): Record<string, unknown> {
+  try {
+    return scrubValues(meta, { sendDefaultPii, exemptKeys: VALUE_SCRUB_EXEMPT_KEYS });
+  } catch {
+    return meta;
+  }
+}
+
+/** Value-scrub a free-text string (e.g. error message). Fail-open. */
+function scrubMessage(message: unknown, sendDefaultPii: boolean): unknown {
+  if (typeof message !== 'string') return message;
+  try {
+    return scrubString(message, sendDefaultPii);
+  } catch {
+    return message;
+  }
+}
+
+/** Value-scrub breadcrumb message + data, exempting nothing. Fail-open. */
+function scrubBreadcrumbs(crumbs: ScopeBreadcrumb[], sendDefaultPii: boolean): ScopeBreadcrumb[] {
+  try {
+    return crumbs.map((c) => scrubValues(c, { sendDefaultPii }));
+  } catch {
+    return crumbs;
+  }
+}
+
 /** Flatten merged scope into a metadata bag (pre-redaction). */
 function scopeMetadata(merged: MergedScopeData): Record<string, unknown> {
   const meta: Record<string, unknown> = {};
@@ -469,12 +541,17 @@ function applyScopeToPayload(
   payload: Record<string, unknown>,
   extraRedact: RegExp[],
   merged: MergedScopeData,
+  sendDefaultPii: boolean,
 ): Record<string, unknown> {
   const baseMeta = (payload.metadata as Record<string, unknown> | undefined) ?? {};
-  payload.metadata = redactMap({ ...baseMeta, ...scopeMetadata(merged) }, extraRedact);
+  // Key-based redaction first, then value-pattern scrubbing of the surviving
+  // string values (explicit-user identity keys exempt so setUser email/id ship).
+  const keyRedacted = redactMap({ ...baseMeta, ...scopeMetadata(merged) }, extraRedact) ?? {};
+  payload.metadata = scrubMetadata(keyRedacted, sendDefaultPii);
+  if (typeof payload.message === 'string') payload.message = scrubMessage(payload.message, sendDefaultPii);
   if (merged.level) payload.level = merged.level;
   if (merged.fingerprint) payload.fingerprint = merged.fingerprint;
-  if (merged.breadcrumbs.length) payload.breadcrumbs = merged.breadcrumbs;
+  if (merged.breadcrumbs.length) payload.breadcrumbs = scrubBreadcrumbs(merged.breadcrumbs, sendDefaultPii);
   if (merged.user?.id != null && payload.userId === undefined) {
     payload.userId = String(merged.user.id);
   }
@@ -506,7 +583,9 @@ export function captureException(error: unknown, hint?: { extra?: Record<string,
       ...(hint?.extra ?? {}),
     },
   };
-  applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged());
+  // applyScopeToPayload value-scrubs metadata + message; stackTrace frames are
+  // intentionally NOT scrubbed (filenames/functions are not PII).
+  applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged(), ctx.sendDefaultPii);
   // Release-health: a manual captureException is a HANDLED error (or a fatal
   // one if the caller marked it). Mirrors the reference SessionTracker model.
   recordSessionForLevel(level);
@@ -531,7 +610,7 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
       service: ctx.config.serviceName || '',
     },
   };
-  applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged());
+  applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged(), ctx.sendDefaultPii);
   recordSessionForLevel(level);
   void dispatch(ctx.transport, ctx.config, { path: '/ingest/v1/errors', payload });
 }
@@ -587,6 +666,7 @@ export class AllStakNestInterceptor {
   private config: AllStakNestConfig;
   private extraRedact: RegExp[];
   private release: string;
+  private sendDefaultPii: boolean;
 
   constructor(
     @Optional() @Inject(ALLSTAK_OPTIONS) config?: AllStakNestConfig,
@@ -595,6 +675,7 @@ export class AllStakNestInterceptor {
     this.config = config || {};
     this.extraRedact = compileExtra(this.config.redactKeys);
     this.release = releaseOf(this.config);
+    this.sendDefaultPii = sendDefaultPiiOf(this.config);
     if (!this.transport) {
       this.transport = new AllStakNestTransport({
         host: normalizeHost(this.config.host || this.config.endpoint),
@@ -604,7 +685,7 @@ export class AllStakNestInterceptor {
       });
     }
     registerRuntimeRelease(this.config, this.transport, this.release);
-    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release });
+    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release, sendDefaultPii: this.sendDefaultPii });
   }
 
   intercept(context: ExecutionContextLike, next: CallHandlerLike): unknown {
@@ -678,13 +759,16 @@ export class AllStakNestInterceptor {
             requestHeaders: this.config.captureRequestHeaders
               ? redactHeadersToString(request.headers, this.extraRedact)
               : '',
-            metadata: redactMap(
-              {
-                'sdk.name': SDK_NAME,
-                'sdk.version': SDK_VERSION,
-                ...scopeMetadata(merged),
-              },
-              this.extraRedact,
+            metadata: scrubMetadata(
+              redactMap(
+                {
+                  'sdk.name': SDK_NAME,
+                  'sdk.version': SDK_VERSION,
+                  ...scopeMetadata(merged),
+                },
+                this.extraRedact,
+              ) ?? {},
+              this.sendDefaultPii,
             ),
           },
         ],
@@ -732,6 +816,7 @@ export class AllStakNestExceptionFilter {
   private config: AllStakNestConfig;
   private extraRedact: RegExp[];
   private release: string;
+  private sendDefaultPii: boolean;
 
   constructor(
     @Optional() @Inject(ALLSTAK_OPTIONS) config?: AllStakNestConfig,
@@ -740,6 +825,7 @@ export class AllStakNestExceptionFilter {
     this.config = config || {};
     this.extraRedact = compileExtra(this.config.redactKeys);
     this.release = releaseOf(this.config);
+    this.sendDefaultPii = sendDefaultPiiOf(this.config);
     if (!this.transport) {
       this.transport = new AllStakNestTransport({
         host: normalizeHost(this.config.host || this.config.endpoint),
@@ -749,7 +835,7 @@ export class AllStakNestExceptionFilter {
       });
     }
     registerRuntimeRelease(this.config, this.transport, this.release);
-    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release });
+    registerActiveContext({ transport: this.transport, config: this.config, extraRedact: this.extraRedact, release: this.release, sendDefaultPii: this.sendDefaultPii });
   }
 
   catch(exception: unknown, context: ExecutionContextLike): never {
@@ -783,9 +869,10 @@ export class AllStakNestExceptionFilter {
       },
     };
     // Merge the active request scope (user/tags/extras/contexts/breadcrumbs)
-    // and apply redaction. Read the scope off the request object (set by the
-    // interceptor) so it is correct regardless of async-context propagation.
-    applyScopeToPayload(payload, this.extraRedact, scopeManager.getMergedFor(request.allstakScope));
+    // and apply redaction + value-pattern PII scrubbing. Read the scope off the
+    // request object (set by the interceptor) so it is correct regardless of
+    // async-context propagation.
+    applyScopeToPayload(payload, this.extraRedact, scopeManager.getMergedFor(request.allstakScope), this.sendDefaultPii);
     // Release-health: a request that reached the global exception filter is a
     // HANDLED error from the process's perspective (Nest returns a 500 and the
     // process keeps running) ⇒ mark the session errored, not crashed.
