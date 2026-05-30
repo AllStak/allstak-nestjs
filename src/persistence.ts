@@ -9,9 +9,9 @@
  * re-sends each entry through the normal pipeline, removing an entry only after
  * it is accepted (2xx) or is permanently undeliverable (a 4xx other than 429).
  *
- * This mirrors @sentry's offline transport (envelopes persisted to a cache dir
- * and replayed on the next start) using the idiomatic Node mechanism: a spool
- * directory with one small JSON file per envelope.
+ * This follows the standard offline-transport pattern (envelopes persisted to a
+ * cache dir and replayed on the next start) using the idiomatic Node mechanism:
+ * a spool directory with one small JSON file per envelope.
  *
  * Design constraints honoured here:
  *   - SCRUB BEFORE PERSIST: callers pass the scrubbed JSON body string; this

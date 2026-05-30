@@ -1,6 +1,6 @@
 /**
- * Value-pattern PII scrubbing tests for @allstak/nestjs (Sentry data-scrubbing
- * parity). Covers the two-tier redaction model:
+ * Value-pattern PII scrubbing tests for @allstak/nestjs. Covers the two-tier
+ * redaction model:
  *
  *   A) ALWAYS scrub (regardless of sendDefaultPii):
  *      - credit-card numbers that PASS the Luhn checksum (Luhn-invalid digit

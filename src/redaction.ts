@@ -27,7 +27,7 @@ const DEFAULT_REDACTED_KEY_PATTERNS: RegExp[] = [
 const REDACTED = '[REDACTED]';
 
 // ───────────────────────────────────────────────────────────────────────────
-// Value-pattern scrubbing (Sentry data-scrubbing parity)
+// Value-pattern scrubbing (free-text data-scrubbing)
 //
 // Key-based redaction (above) nukes a value when its KEY looks sensitive. This
 // layer scrubs PII that leaks into free-text string VALUES regardless of key.

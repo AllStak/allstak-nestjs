@@ -52,6 +52,8 @@ AllStakModule.forRootAsync({
 - Inbound HTTP request telemetry.
 - Outbound HTTP request telemetry (global `fetch`, plus optional `@nestjs/axios`).
 - Unhandled exceptions with stack traces.
+- Process-level fatal errors (uncaught exceptions / unhandled rejections) that escape the request pipeline.
+- Database queries (opt-in Prisma / TypeORM instrumentation) with the active trace.
 - Server + client spans for each request and downstream call.
 - W3C `traceparent` + `baggage` propagation on inbound responses AND outbound calls.
 
@@ -72,6 +74,8 @@ AllStakModule.forRootAsync({
 | `enableOfflineQueue` | Persist undeliverable telemetry to a bounded filesystem spool and replay it on the next init. Default: `true`. |
 | `offlineQueueDir` | Spool directory. Default: `<os.tmpdir()>/allstak-nestjs-spool`. |
 | `enableOutboundHttp` | Instrument outbound HTTP (global `fetch`): inject trace headers on egress and emit outbound spans/requests. Default: `true`. |
+| `enableGlobalErrorHandlers` | Install `process.on('uncaughtException'/'unhandledRejection')` so fatal errors that escape the request pipeline are captured at `fatal` level and the session is marked crashed. Default: `true`. |
+| `enableDbInstrumentation` | Gate the opt-in `instrumentPrisma()` / `instrumentDataSource()` ORM query instrumentation. Default: `true`. |
 
 ## Release health
 
@@ -124,6 +128,45 @@ export class HttpTracing implements OnModuleInit {
   }
 }
 ```
+
+## Global error handlers
+
+The interceptor and exception filter only see errors that flow through the
+NestJS request pipeline. A truly unhandled error thrown off that path — in a
+timer, an event-emitter callback, or a forgotten `await` — would otherwise
+terminate the process with nothing captured. On module init the SDK installs
+`process.on('uncaughtException')` and `process.on('unhandledRejection')` so such
+a failure is captured at `fatal` level, the release-health session is marked
+`crashed`, and buffered telemetry is flushed before exit.
+
+Node's existing behaviour is preserved: for an uncaught exception the SDK
+re-emits out-of-band **only** when it is the sole listener (so Node's default
+crash-and-exit still applies); when your app has its own `uncaughtException`
+listener the SDK does not force an exit — your handler owns that decision.
+Unhandled rejections are captured without changing the process's rejection mode.
+The whole path is fail-open. Set `enableGlobalErrorHandlers: false` to opt out.
+
+## Database queries (Prisma / TypeORM)
+
+Opt-in ORM instrumentation emits a `/ingest/v1/db` row for every query —
+normalized SQL (literal values stripped to `?`, so no parameter values leave the
+process), duration, status, and the **active request trace/span ids** so a query
+made while handling a request becomes a child of that request's trace. Prisma
+and TypeORM are optional/peer integrations the SDK never hard-depends on; you
+pass your client / data-source in once, mirroring `instrumentHttpService()`.
+
+```ts
+// Prisma — $extends returns a NEW client, so assign it back.
+import { instrumentPrisma } from '@allstak/nestjs';
+prisma = instrumentPrisma(prisma);
+
+// TypeORM — attaches a query logger to your DataSource.
+import { instrumentDataSource } from '@allstak/nestjs';
+instrumentDataSource(dataSource);
+```
+
+Both helpers are idempotent and fail-open. Set `enableDbInstrumentation: false`
+to make them no-ops.
 
 ## Privacy
 

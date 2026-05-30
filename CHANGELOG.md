@@ -4,7 +4,55 @@ All notable changes to @allstak/nestjs will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]## [0.1.0] — 2026-05-29
+## [0.2.0] — 2026-05-30
+
+Auto-instrumentation wave: make global crash capture and ORM query telemetry
+automatic (default-on, near-zero developer config) on top of `0.1.0`.
+
+### Added — Global uncaught/unhandled error handlers (process-level crash capture)
+- New `crash.ts` installs `process.on('uncaughtException')` +
+  `process.on('unhandledRejection')` at module startup so a FATAL error that
+  escapes the NestJS request pipeline (a timer, an event-emitter callback, a
+  forgotten `await`) is still captured at `fatal` level
+  (`POST /ingest/v1/errors`, `metadata.mechanism` = the originating event,
+  `handled: false`), the active release-health session is marked `crashed`
+  (`recordCrash`), and buffered telemetry is flushed before exit.
+- PRESERVES Node semantics: for `uncaughtException` the SDK re-emits out-of-band
+  only when it is the SOLE listener (so Node's default crash-and-exit still
+  applies); when the host has its own listener the SDK does NOT force an exit.
+  `unhandledRejection` is captured without changing the process's rejection mode.
+- Gated by `enableGlobalErrorHandlers` (default `true`; auto-skipped under a
+  unit-test runtime — `NODE_ENV=test` / `VITEST`). Idempotent across module
+  registrations, removed on graceful shutdown, and fully fail-open.
+- New `transport.flush()` awaits in-flight deliveries (bounded) without entering
+  shutdown mode, so a fresh fatal event is still attempted on the wire.
+- Exports `installGlobalErrorHandlers`, `captureFatal`, and the `CrashDeps` /
+  `CrashProcess` types.
+
+### Added — ORM DB auto-instrumentation (`/ingest/v1/db`)
+- New `db.ts` opt-in (default-on, gated by `enableDbInstrumentation`) ORM
+  instrumentation emitting `POST /ingest/v1/db` rows (normalized SQL with
+  literals stripped to `?`, query hash, type, duration, status, error text, and
+  the ACTIVE request trace/span ids) through the existing
+  transport/redaction/beforeSend pipeline. A DB call made while handling a
+  request becomes a child of that request's trace; a sampled-out trace emits no
+  telemetry. No parameter VALUES ever leave the process.
+- `instrumentPrisma(client)` — a Prisma client extension (`$extends`) timing
+  every model/raw operation; returns the EXTENDED client (assign it back).
+- `instrumentDataSource(dataSource)` — a TypeORM `Logger` adapter capturing every
+  executed query and query error, preserving any existing logger as a delegate.
+- Prisma / TypeORM are OPTIONAL/peer integrations — the SDK imports neither; the
+  host passes its client / data-source in (mirrors `instrumentHttpService()`).
+  Both helpers are idempotent and fully fail-open.
+- Exports `instrumentPrisma`, `instrumentDataSource`, `createTypeOrmLogger`,
+  `normalizeQuery`, `hashQuery`, `detectQueryType`, `emitDbQuery`, and the
+  `DbConfig` / `DbDeps` / `DbDispatch` / `DbQueryInfo` types.
+
+### Tests
+- New suites `test/crash.test.ts` (10) and `test/db.test.ts` (20). 150/150 vitest
+  pass.
+
+## [0.1.0] — 2026-05-29
 
 This entry collects the feature waves landed on top of `0.1.0-beta.3`. They are
 staged in the manifest under `0.1.0-beta.4`; the release version is chosen at the
@@ -69,7 +117,7 @@ Lands the full SDK source on the canonical AllStak repo (transport.ts, redaction
 - `transport.ts` scrubs the full payload at the wire chokepoint (before JSON.stringify) — defense-in-depth on top of the existing metadata scrub. Pure, fail-open.
 
 ### Live canary E2E
-- Event `1c179d5e-965b-4e80-83f1-4c995b02a33d` against `api.allstak.sa`. ClickHouse `leak_pos = 0` across all 4 columns. Canary `should_not_leak_nestjs` planted in 11 fields + 3-level-nested token — all scrubbed.
+- Live canary run against `api.allstak.sa` confirmed zero leaks across all stored columns. Canary `should_not_leak_nestjs` planted in 11 fields + 3-level-nested token — all scrubbed.
 
 ### Tests
 - 14/14 vitest pass.

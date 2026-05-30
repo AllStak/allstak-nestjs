@@ -39,6 +39,13 @@ import {
   type OutboundConfig,
   type OutboundDeps,
 } from './outbound';
+import {
+  instrumentPrisma as instrumentPrismaClient,
+  instrumentDataSource as instrumentTypeOrmDataSource,
+  type DbConfig,
+  type DbDeps,
+} from './db';
+import { installGlobalErrorHandlers, type CrashDeps, type CrashProcess } from './crash';
 
 export { SDK_NAME, SDK_VERSION } from './version';
 export { Scope } from './scope';
@@ -68,6 +75,16 @@ export {
 export type { OutboundConfig, OutboundDeps, OutboundSink } from './outbound';
 export { TraceContextManager } from './tracing';
 export type { TraceContext } from './tracing';
+export {
+  normalizeQuery,
+  hashQuery,
+  detectQueryType,
+  emitDbQuery,
+  createTypeOrmLogger,
+} from './db';
+export type { DbConfig, DbDeps, DbDispatch, DbQueryInfo } from './db';
+export { installGlobalErrorHandlers } from './crash';
+export type { CrashDeps, CrashProcess } from './crash';
 
 /** Injection token used by AllStakModule.forRoot() to provide config. */
 export const ALLSTAK_OPTIONS = 'ALLSTAK_OPTIONS';
@@ -122,8 +139,7 @@ export interface AllStakNestConfig {
   redactKeys?: (string | RegExp)[];
   /**
    * Send personally-identifiable information that the SDK would otherwise scrub
-   * from free-text values. Default FALSE (matches Sentry's `sendDefaultPii`
-   * default and is the privacy-safe choice).
+   * from free-text values. Default FALSE (the privacy-safe choice).
    *
    * - `false` (default): email addresses and IPv4/IPv6 literals found inside
    *   string VALUES (error messages, extras/contexts, breadcrumbs, captured
@@ -192,10 +208,41 @@ export interface AllStakNestConfig {
    * Skipped automatically under a unit-test runtime unless explicitly enabled.
    */
   enableOutboundHttp?: boolean;
+  /**
+   * Install process-level `uncaughtException` + `unhandledRejection` handlers at
+   * module startup so a FATAL error that escapes all request handling is still
+   * captured (routed at `fatal` level to `/ingest/v1/errors`), the release-health
+   * session is marked `crashed`, and buffered telemetry is flushed before the
+   * process exits. Default true; set false to opt out. Auto-skipped under a
+   * unit-test runtime unless explicitly enabled (the global-handler install would
+   * otherwise bleed across suites). Node-only — no-op without a Node `process`.
+   *
+   * Per Node semantics the SDK PRESERVES the host's existing behaviour: after
+   * flushing, an `uncaughtException` with no OTHER listener re-emits so Node's
+   * default crash-and-exit applies; if the host already has its own listener the
+   * SDK does NOT force an exit (the host owns the decision). `unhandledRejection`
+   * is captured without altering the process's rejection mode.
+   */
+  enableGlobalErrorHandlers?: boolean;
+  /**
+   * Opt-in ORM auto-instrumentation: capture database queries as
+   * `/ingest/v1/db` telemetry (normalized SQL, duration, status, and the active
+   * trace/span ids) with near-zero per-call code. This flag GATES the
+   * `instrumentPrisma()` / `instrumentDataSource()` helpers — when false they are
+   * no-ops. Default true (the helpers still require an explicit one-line
+   * registration call with your client/data-source, mirroring
+   * `instrumentHttpService()`; the SDK never imports Prisma or TypeORM).
+   */
+  enableDbInstrumentation?: boolean;
 }
 
 export interface AllStakOutboundEvent {
-  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans' | '/ingest/v1/releases';
+  path:
+    | '/ingest/v1/http-requests'
+    | '/ingest/v1/errors'
+    | '/ingest/v1/spans'
+    | '/ingest/v1/releases'
+    | '/ingest/v1/db';
   payload: Record<string, unknown>;
 }
 
@@ -333,6 +380,28 @@ function shouldInstrumentOutbound(value: boolean | undefined): boolean {
   return !isLikelyTestRuntime();
 }
 
+/**
+ * Whether ORM DB auto-instrumentation should run. Default true; explicit `false`
+ * opts out. Unlike outbound/session there is NO unit-test auto-skip: the
+ * instrument* helpers require an explicit client/data-source from the caller, so
+ * they cannot bleed across suites the way a global-fetch/process install can.
+ */
+function shouldInstrumentDb(value: boolean | undefined): boolean {
+  return value !== false;
+}
+
+/**
+ * Whether the process-level fatal-error handlers should be installed. Default
+ * true; explicit `false` opts out. Auto-skip under a unit-test runtime (a global
+ * `process.on` install would otherwise bleed across suites); tests opt back in
+ * with an explicit flag.
+ */
+function shouldInstallGlobalErrorHandlers(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  return !isLikelyTestRuntime();
+}
+
 /** Build the OutboundConfig from a resolved config + release + pii decision. */
 function outboundConfigOf(config: AllStakNestConfig, release: string, sendDefaultPii: boolean): OutboundConfig {
   return {
@@ -359,6 +428,33 @@ function outboundDepsOf(
     scrub: (s: string) => String(scrubMessage(s, sendDefaultPii)),
     dispatch: (path, payload) =>
       void dispatch(transport, config, { path: path as AllStakOutboundEvent['path'], payload }),
+  };
+}
+
+/** Build the DbConfig from a resolved config + release + pii decision. */
+function dbConfigOf(config: AllStakNestConfig, release: string, sendDefaultPii: boolean): DbConfig {
+  return {
+    serviceName: config.serviceName || '',
+    environment: config.environment || '',
+    release,
+    sendDefaultPii,
+  };
+}
+
+/**
+ * Build the DbDeps wiring DB instrumentation to the active module's transport/
+ * config dispatch pipeline + the active trace context + the module's value
+ * scrubber. Reuses dispatch() so beforeSend + redaction still run on `/db` rows.
+ */
+function dbDepsOf(
+  transport: AllStakNestTransport,
+  config: AllStakNestConfig,
+  sendDefaultPii: boolean,
+): DbDeps {
+  return {
+    traceContext: traceContextManager,
+    scrub: (s: string) => String(scrubMessage(s, sendDefaultPii)),
+    dispatch: (path, payload) => void dispatch(transport, config, { path, payload }),
   };
 }
 
@@ -392,6 +488,66 @@ function maybeInstallOutboundFetch(
 /** @internal — exposed for tests; resets the install guard. */
 export function _resetOutboundInstallForTest(): void {
   outboundFetchInstalled = false;
+}
+
+/** Idempotency guard + uninstall handle so the crash handlers install once. */
+let crashUninstall: (() => void) | null = null;
+
+/**
+ * Build the crash deps from the active module context. Captures fatal errors
+ * through the same pipeline, ends the active session as crashed, and flushes
+ * the active transport (bounded). All steps fail-open.
+ */
+function crashDepsOf(): CrashDeps {
+  return {
+    captureFatal: (error, source) => captureFatal(error, source),
+    endSessionCrashed: () => {
+      const tracker = activeSessionTracker;
+      if (!tracker) return;
+      try {
+        tracker.end('crashed');
+      } catch {
+        /* release-health end is best-effort */
+      }
+    },
+    flush: async () => {
+      const t = activeContext?.transport;
+      if (!t) return;
+      try {
+        await t.flush();
+      } catch {
+        /* flush is best-effort */
+      }
+    },
+  };
+}
+
+/**
+ * Install the process-level fatal-error handlers once, gated by config.
+ * Fail-open. `processOverride` lets the lifecycle/tests inject a fake process;
+ * production passes nothing so the real `process` is used.
+ */
+function maybeInstallGlobalErrorHandlers(
+  config: AllStakNestConfig,
+  processOverride?: CrashProcess,
+): void {
+  if (crashUninstall) return;
+  if (!shouldInstallGlobalErrorHandlers(config.enableGlobalErrorHandlers)) return;
+  try {
+    crashUninstall = installGlobalErrorHandlers(crashDepsOf(), processOverride);
+  } catch {
+    /* a crash-handler install failure must never break module init */
+  }
+}
+
+/** @internal — exposed for tests; uninstalls the handlers and clears the guard. */
+export function _resetGlobalErrorHandlersForTest(): void {
+  try {
+    crashUninstall?.();
+  } catch {
+    /* best-effort */
+  }
+  crashUninstall = null;
 }
 
 function pathOf(request: RequestLike): string {
@@ -524,8 +680,8 @@ export function _resetSessionTrackerForTest(): void {
 }
 
 /**
- * Whether the caller opted into PII (Sentry `sendDefaultPii`). Default false =
- * privacy-safe parity: the email/IP value scrubbers run and auto-collected IP
+ * Whether the caller opted into PII (`sendDefaultPii`). Default false =
+ * privacy-safe: the email/IP value scrubbers run and auto-collected IP
  * is dropped. (A)-tier scrubbing (CC/SSN) is always on regardless.
  */
 function sendDefaultPiiOf(config: AllStakNestConfig): boolean {
@@ -534,7 +690,7 @@ function sendDefaultPiiOf(config: AllStakNestConfig): boolean {
 
 /**
  * Metadata keys carrying EXPLICIT identity set via setUser(). These are
- * intentional identification (Sentry never strips explicitly-set user data), so
+ * intentional identification (explicitly-set user data is never stripped), so
  * they are exempt from value-pattern scrubbing — they still ship verbatim even
  * when sendDefaultPii is false. They are NOT exempt from KEY-based redaction.
  */
@@ -667,6 +823,42 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
   void dispatch(ctx.transport, ctx.config, { path: '/ingest/v1/errors', payload });
 }
 
+/**
+ * Capture a FATAL error (an uncaughtException / unhandledRejection that escaped
+ * the request pipeline) at `fatal` level. Like {@link captureException} but
+ * always `fatal` (which marks the release-health session `crashed`) and tagged
+ * with the originating process event. Wired into the global handlers installed
+ * by the session lifecycle. No-op if AllStakModule was never registered.
+ */
+export function captureFatal(
+  error: unknown,
+  source: 'uncaughtException' | 'unhandledRejection' = 'uncaughtException',
+): void {
+  const ctx = activeContext;
+  if (!ctx) return;
+  const err = error instanceof Error ? error : new Error(String(error));
+  const payload: Record<string, unknown> = {
+    exceptionClass: err.name || 'Error',
+    message: err.message,
+    stackTrace: err.stack ? err.stack.split('\n') : [],
+    level: 'fatal',
+    environment: ctx.config.environment || '',
+    release: ctx.release,
+    sessionId: currentSessionId(),
+    metadata: {
+      'sdk.name': SDK_NAME,
+      'sdk.version': SDK_VERSION,
+      service: ctx.config.serviceName || '',
+      mechanism: source,
+      handled: false,
+    },
+  };
+  applyScopeToPayload(payload, ctx.extraRedact, scopeManager.getMerged(), ctx.sendDefaultPii);
+  // fatal ⇒ recordCrash() on the active session (terminal `crashed` status).
+  recordSessionForLevel('fatal');
+  void dispatch(ctx.transport, ctx.config, { path: '/ingest/v1/errors', payload });
+}
+
 /** Set the user on the active (request or global) scope. */
 export function setUser(user: ScopeUser | null): void {
   scopeManager.getCurrentScope().setUser(user);
@@ -732,6 +924,68 @@ export function instrumentHttpService(httpService: unknown): boolean {
       axios as Parameters<typeof instrumentAxiosInstance>[0],
       outboundConfigOf(ctx.config, ctx.release, ctx.sendDefaultPii),
       outboundDepsOf(ctx.transport, ctx.config, ctx.sendDefaultPii),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Auto-instrument a Prisma client so every query emits `/ingest/v1/db` telemetry
+ * (normalized SQL, duration, status, and the active request trace/span ids) with
+ * no per-call code — the ORM counterpart to {@link instrumentHttpService}. Prisma
+ * is an OPTIONAL/peer integration: this SDK never imports `@prisma/client`, the
+ * host passes its client in.
+ *
+ * Prisma's `$extends` returns a NEW client (the original is immutable), so this
+ * RETURNS the instrumented client and the caller must assign it back:
+ *
+ * ```ts
+ * prisma = instrumentPrisma(prisma);
+ * ```
+ *
+ * Idempotent per client and fully fail-open: when AllStakModule was not
+ * registered, when `enableDbInstrumentation` is disabled, or when the value is
+ * not a Prisma client, the ORIGINAL client is returned unchanged.
+ */
+export function instrumentPrisma<T>(client: T, databaseType?: string): T {
+  const ctx = activeContext;
+  if (!ctx) return client;
+  if (!shouldInstrumentDb(ctx.config.enableDbInstrumentation)) return client;
+  try {
+    return instrumentPrismaClient(
+      client,
+      dbConfigOf(ctx.config, ctx.release, ctx.sendDefaultPii),
+      dbDepsOf(ctx.transport, ctx.config, ctx.sendDefaultPii),
+      databaseType,
+    );
+  } catch {
+    return client; // never hand back a broken client
+  }
+}
+
+/**
+ * Auto-instrument a TypeORM `DataSource` so every executed query (and query
+ * error) emits `/ingest/v1/db` telemetry with the active trace/span ids — the
+ * TypeORM counterpart to {@link instrumentHttpService}. TypeORM is an
+ * OPTIONAL/peer integration: this SDK never imports `typeorm`, the host passes
+ * its DataSource in.
+ *
+ * Attaches an AllStak query logger to the data-source (preserving any existing
+ * logger as a delegate) and enables query/error logging when the host has not
+ * explicitly configured it. Idempotent per data-source and fully fail-open.
+ * Returns true when wired; false when AllStakModule was not registered, when
+ * `enableDbInstrumentation` is disabled, or when the value is not a DataSource.
+ */
+export function instrumentDataSource(dataSource: unknown): boolean {
+  const ctx = activeContext;
+  if (!ctx) return false;
+  if (!shouldInstrumentDb(ctx.config.enableDbInstrumentation)) return false;
+  try {
+    return instrumentTypeOrmDataSource(
+      dataSource,
+      dbConfigOf(ctx.config, ctx.release, ctx.sendDefaultPii),
+      dbDepsOf(ctx.transport, ctx.config, ctx.sendDefaultPii),
     );
   } catch {
     return false;
@@ -990,7 +1244,11 @@ export function createAllStakNestExceptionFilter(config: AllStakNestConfig): All
 export class AllStakSessionLifecycle implements OnModuleInit, OnApplicationShutdown {
   private config: AllStakNestConfig;
   private release: string;
+  private sendDefaultPii: boolean;
+  private extraRedact: RegExp[];
   private tracker: SessionTracker | null = null;
+  /** Test seam: inject a fake `process` for the global-handler install. */
+  private crashProcess?: CrashProcess;
 
   constructor(
     @Optional() @Inject(ALLSTAK_OPTIONS) config?: AllStakNestConfig,
@@ -998,6 +1256,8 @@ export class AllStakSessionLifecycle implements OnModuleInit, OnApplicationShutd
   ) {
     this.config = config || {};
     this.release = releaseOf(this.config);
+    this.sendDefaultPii = sendDefaultPiiOf(this.config);
+    this.extraRedact = compileExtra(this.config.redactKeys);
     if (!this.transport) {
       this.transport = new AllStakNestTransport({
         host: normalizeHost(this.config.host || this.config.endpoint),
@@ -1008,27 +1268,53 @@ export class AllStakSessionLifecycle implements OnModuleInit, OnApplicationShutd
     }
   }
 
+  /** @internal — test seam to inject a fake `process` for handler tests. */
+  _setCrashProcessForTest(proc: CrashProcess): void {
+    this.crashProcess = proc;
+  }
+
   onModuleInit(): void {
     try {
-      if (!shouldTrackSessions(this.config.enableAutoSessionTracking)) return;
-      this.tracker = new SessionTracker(
-        {
-          // Release falls back to the SDK version upstream (resolveRelease),
-          // so a non-empty release is the norm; an empty release keeps the
-          // in-memory tracker but skips the network call.
-          release: this.release,
-          environment: this.config.environment,
-          userId: this.config.userId,
-          sdkName: SDK_NAME,
-          sdkVersion: SDK_VERSION,
-          platform: platformOf(this.config),
-        },
-        this.transport!,
-      );
-      activeSessionTracker = this.tracker;
-      this.tracker.start();
+      if (shouldTrackSessions(this.config.enableAutoSessionTracking)) {
+        this.tracker = new SessionTracker(
+          {
+            // Release falls back to the SDK version upstream (resolveRelease),
+            // so a non-empty release is the norm; an empty release keeps the
+            // in-memory tracker but skips the network call.
+            release: this.release,
+            environment: this.config.environment,
+            userId: this.config.userId,
+            sdkName: SDK_NAME,
+            sdkVersion: SDK_VERSION,
+            platform: platformOf(this.config),
+          },
+          this.transport!,
+        );
+        activeSessionTracker = this.tracker;
+        this.tracker.start();
+      }
     } catch {
       /* session tracking must never block module init */
+    }
+    // Global fatal-error handlers. captureFatal() needs an active capture
+    // context; the interceptor/filter normally register a richer one, but a
+    // crash can happen before any request is handled, so register a fallback
+    // context here when none exists yet (the interceptor overwrites it later).
+    try {
+      if (shouldInstallGlobalErrorHandlers(this.config.enableGlobalErrorHandlers)) {
+        if (!activeContext) {
+          registerActiveContext({
+            transport: this.transport!,
+            config: this.config,
+            extraRedact: this.extraRedact,
+            release: this.release,
+            sendDefaultPii: this.sendDefaultPii,
+          });
+        }
+        maybeInstallGlobalErrorHandlers(this.config, this.crashProcess);
+      }
+    } catch {
+      /* global-handler install must never block module init */
     }
   }
 
@@ -1039,6 +1325,10 @@ export class AllStakSessionLifecycle implements OnModuleInit, OnApplicationShutd
       /* best-effort, must not throw on shutdown */
     } finally {
       if (activeSessionTracker === this.tracker) activeSessionTracker = null;
+      // Remove the process-level handlers this lifecycle installed so a graceful
+      // shutdown does not leave dangling listeners (and so a subsequent module
+      // registration can re-install cleanly).
+      _resetGlobalErrorHandlersForTest();
     }
   }
 }

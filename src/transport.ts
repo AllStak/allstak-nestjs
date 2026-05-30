@@ -122,6 +122,20 @@ export class AllStakNestTransport {
   }
 
   /**
+   * Await in-flight deliveries (best-effort, bounded by `timeoutMs`) WITHOUT
+   * entering the shutting-down mode. Used by the global fatal-error handlers to
+   * give an `/ingest/v1/errors` + `/sessions/end` POST a chance to land before
+   * the process exits. Unlike {@link shutdown} this does not flip events to the
+   * persist-only path, so a fresh fatal event is still attempted on the wire.
+   */
+  async flush(timeoutMs = 2000): Promise<void> {
+    const start = Date.now();
+    while (this.inFlight > 0 && Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  /**
    * Scrub the full wire payload before serialization. The module already
    * applies redactMap to metadata at construction; this chokepoint catches any
    * top-level sensitive keys (e.g. callers who bypass setMetadata) and provides

@@ -24,7 +24,7 @@ import type { AllStakNestTransport } from './transport';
 
 /**
  * Lifecycle status of a release-health session. Vocabulary matches the AllStak
- * backend's `/ingest/v1/sessions/end` contract and Sentry's release-health
+ * backend's `/ingest/v1/sessions/end` contract and standard release-health
  * conventions:
  *
  *   - `ok`       — session ran with at most non-fatal logs.
