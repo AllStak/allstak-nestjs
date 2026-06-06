@@ -283,6 +283,9 @@ describe('@allstak/nestjs — sessionId on error events', () => {
     await vi.waitFor(() => expect(callsFor(fetchSpy, '/ingest/v1/errors').length).toBe(1));
     const errBody = bodyOf(callsFor(fetchSpy, '/ingest/v1/errors')[0]);
     expect(errBody.sessionId).toBe(sessionId);
+    expect(errBody.sdkName).toBe(SDK_NAME);
+    expect(errBody.sdkVersion).toBe(SDK_VERSION);
+    expect(errBody.platform).toBe('node');
 
     // The handled request error escalated the session to errored.
     expect(_getActiveSessionTracker()!.current()!.status).toBe('errored');
